@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -116,6 +117,7 @@ def verify_mutations(
     except OSError as exc:
         raise VerificationPreflightError(f"could not read manifest or workspace: {exc}") from exc
     final_path, partial_path = _validate_output_paths(Path(output), force)
+    _reject_output_input_collisions(final_path, partial_path, Path(manifest), rows)
     scratch = _prepare_work_dir(Path(work_dir))
 
     # Hashing is part of preflight: a row without complete hashes is not valid evidence.
@@ -147,7 +149,7 @@ def verify_mutations(
                         toolchain,
                         str(exc),
                         Path(workspace_root),
-                        Path(work_dir),
+                        scratch,
                     )
                 handle.write(deterministic_json(evidence) + "\n")
                 handle.flush()
@@ -365,19 +367,23 @@ def _simulate_design(
     if compiled.timed_out:
         return failed("timeout"), _diagnostic("simulation compile", compiled, workspace_root, cwd, manifest_path)
     if compiled.startup_error or compiled.returncode != 0:
-        reason = "simulation_not_detected" if meaning == "mutated_detects_mutation" else (
-            "original_simulation_failure" if meaning == "original_passes" else "repaired_simulation_failure"
-        )
-        return failed(reason), _diagnostic("simulation compile", compiled, workspace_root, cwd, manifest_path)
+        return failed("compile_failure"), _diagnostic("simulation compile", compiled, workspace_root, cwd, manifest_path)
     simulated = _run([vvp, str(binary)], cwd, timeout)
     if simulated.timed_out:
         return failed("timeout"), _diagnostic("simulation", simulated, workspace_root, cwd, manifest_path)
     output = simulated.output
     semantic_failure = _semantic_failure(output)
     if meaning == "mutated_detects_mutation":
+        if simulated.startup_error:
+            return failed("simulation_failure"), _diagnostic("simulation", simulated, workspace_root, cwd, manifest_path)
         if semantic_failure:
             return passed(), _diagnostic("simulation", simulated, workspace_root, cwd, manifest_path, only_if_output=True)
+        if simulated.returncode != 0:
+            return failed("simulation_failure"), _diagnostic("simulation", simulated, workspace_root, cwd, manifest_path)
         return failed("simulation_not_detected"), _diagnostic("simulation", simulated, workspace_root, cwd, manifest_path)
+    if simulated.startup_error:
+        reason = "original_simulation_failure" if meaning == "original_passes" else "repaired_simulation_failure"
+        return failed(reason), _diagnostic("simulation", simulated, workspace_root, cwd, manifest_path)
     if simulated.returncode == 0 and not semantic_failure:
         return passed(), _diagnostic("simulation", simulated, workspace_root, cwd, manifest_path, only_if_output=True)
     reason = "original_simulation_failure" if meaning == "original_passes" else "repaired_simulation_failure"
@@ -583,7 +589,7 @@ def _dedupe_diagnostics(values: list[str]) -> list[str]:
 
 def _validate_output_paths(output: Path, force: bool) -> tuple[Path, Path]:
     requested = output.expanduser()
-    if requested.exists() and requested.is_symlink():
+    if requested.is_symlink():
         raise VerificationPreflightError("output must not be a symlink")
     final = requested.resolve()
     if not final.parent.exists() or not final.parent.is_dir():
@@ -591,7 +597,7 @@ def _validate_output_paths(output: Path, force: bool) -> tuple[Path, Path]:
     if final.exists() and final.is_dir():
         raise VerificationPreflightError(f"output is a directory: {final}")
     partial = Path(str(final) + ".rtlbench-partial")
-    if partial.exists() and partial.is_symlink():
+    if partial.is_symlink():
         raise VerificationPreflightError("managed partial output must not be a symlink")
     if partial.exists() and partial.is_dir():
         raise VerificationPreflightError(f"managed partial output is a directory: {partial}")
@@ -600,6 +606,40 @@ def _validate_output_paths(output: Path, force: bool) -> tuple[Path, Path]:
             f"output already exists; use --force only for {final} and its managed partial"
         )
     return final, partial
+
+
+def _reject_output_input_collisions(
+    final: Path,
+    partial: Path,
+    manifest_path: Path,
+    rows: list[MutationRow],
+) -> None:
+    """Reject output paths that alias any input before output I/O begins."""
+
+    protected: list[tuple[str, Path]] = [("manifest", manifest_path.expanduser().resolve())]
+    for row in rows:
+        for label, path in row.artifact_paths:
+            protected.append((f"{row.mutation_id}:{label}", path))
+
+    for candidate_label, candidate in (("output", final), ("managed partial output", partial)):
+        for protected_label, protected_path in protected:
+            if _paths_alias(candidate, protected_path):
+                raise VerificationPreflightError(
+                    f"{candidate_label} aliases protected input {protected_label}: {candidate}"
+                )
+
+
+def _paths_alias(left: Path, right: Path) -> bool:
+    """Compare normalized paths and existing inodes, including hard links."""
+
+    if left.expanduser().resolve() == right.expanduser().resolve():
+        return True
+    if left.exists() and right.exists():
+        try:
+            return left.samefile(right)
+        except OSError:
+            return False
+    return False
 
 
 def _prepare_work_dir(work_dir: Path) -> Path:
@@ -612,7 +652,10 @@ def _prepare_work_dir(work_dir: Path) -> Path:
         raise VerificationPreflightError(f"could not create work-dir: {exc}") from exc
     if not path.is_dir():
         raise VerificationPreflightError(f"work-dir is not a directory: {path}")
-    return path.resolve()
+    try:
+        return Path(tempfile.mkdtemp(prefix=".rtlbench-run-", dir=str(path.resolve())))
+    except OSError as exc:
+        raise VerificationPreflightError(f"could not create managed run directory: {exc}") from exc
 
 
 def _safe_name(value: str) -> str:

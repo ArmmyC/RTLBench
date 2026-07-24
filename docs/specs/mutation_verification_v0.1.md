@@ -26,8 +26,9 @@ rtlbench verify-mutations --manifest MANIFEST --output OUTPUT \
 The four paths are required. `--timeout` defaults to 30 seconds and bounds
 each tool invocation (version probes use a separate five-second bound).
 `--force` permits replacement of only the exact output path and its managed
-partial path. Rows are processed sequentially in manifest order; v0.1 has no
-concurrency.
+partial path, provided neither path aliases the manifest or any declared RTL,
+testbench, or support input. Rows are processed sequentially in manifest
+order; v0.1 has no concurrency.
 
 The legacy invocation remains valid, including
 `rtlbench --config configs/verilogeval.yaml`; it continues to use the existing
@@ -123,8 +124,10 @@ Each valid row produces exactly one JSONL object with this stable shape:
 
 `input_hashes.support_files` is sorted by manifest path. SHA-256 is computed
 from bytes. Tool names and versions are captured once per run; version output
-is normalized to a bounded single-line sanitized string and failures yield
-`available: false, version: null`.
+is normalized to a bounded single-line sanitized string. A discovered
+executable remains available when its bounded version probe fails, represented
+as `{"available": true, "version": null}`. An executable that is not found is
+represented as `{"available": false, "version": null}`.
 
 Checks are nested by operation and artifact. Compile has `original`,
 `mutated`, and `repaired`; lint and synthesis have `mutated` and `repaired`
@@ -138,9 +141,16 @@ changes evidence output.
 
 Simulation uses the same Icarus testbench for all three artifacts. Detection
 requires successful mutated compilation, testbench execution, and a semantic
-mismatch/nonzero testbench result recognized from mismatch/failure output; a
-compiler error, crash, or timeout cannot count as detection. An unexpectedly
-passing mutation is `simulation_not_detected`. Repaired simulation must pass.
+mismatch/nonzero testbench result recognized from mismatch/failure output. A
+simulation compilation startup error or nonzero compilation return code is
+`compile_failure` for original, mutated, and repaired artifacts. A compilation
+timeout remains `timeout`. A post-compilation simulation startup error or
+unrecognized nonzero simulation return code is `simulation_failure` for the
+mutated artifact, while original and repaired execution failures use their
+artifact-specific categories. An unexpectedly passing mutation is
+`simulation_not_detected` only after compilation and simulation execution
+succeed without a recognized mismatch or semantic failure. Repaired
+simulation must pass.
 
 Synthesis is independent generic Yosys parsing/synthesis and is never called
 functional correctness. Equivalence compares original versus repaired only;
@@ -150,23 +160,29 @@ requested in v0.1.
 
 ## Tiers and failure categories
 
-Tier computation is a pure function. Tier A requires valid metadata and all
-hashes, all three compiles, original simulation pass, mutation detection, and
-repaired simulation pass. Tier B requires valid metadata/hashes, compilation
-evidence, at least one trustworthy lint or synthesis check, and repaired
-structural checks passing, without complete functional evidence. Tier C is
-valid metadata/hashes plus structural validation only when no executable
-semantic evidence exists. Tier D is reserved for non-manifest teacher/model
-hypotheses and is never emitted by this command. A row with preflight or
-hashing failure is a batch/row error and is not emitted as valid evidence.
+Tier computation is a pure function and the evidence-tier value is exactly
+`"A"`, `"B"`, `"C"`, or `null`. Tier A requires valid metadata and all hashes,
+all three compile checks passing, original simulation passing, mutated
+simulation detecting the mutation, and repaired simulation passing. Tier B
+requires valid metadata and hashes, all three compile checks passing, at least
+one attempted lint or synthesis check passing, every attempted repaired lint
+or synthesis check passing, and Tier A not being satisfied. Tier C requires
+valid metadata and hashes, at least one attempted executable compile, lint,
+simulation, synthesis, or equivalence check, and neither Tier A nor Tier B.
+Tier C is limited executable evidence; it does not mean the design passed.
+When metadata and hashes are valid but no executable check was attempted, the
+tier is `null`, including when no checks were requested or every requested
+tool is unavailable. Tier D is reserved for external teacher/model hypotheses
+and is never emitted by `verify-mutations`. A row with preflight or hashing
+failure is a batch/row error and is not emitted as valid evidence.
 
 The finite categories are `passed`, `tool_unavailable`, `compile_failure`,
-`lint_failure`, `simulation_not_detected`, `original_simulation_failure`,
+`lint_failure`, `simulation_failure`, `simulation_not_detected`, `original_simulation_failure`,
 `repaired_simulation_failure`, `synthesis_failure`, `equivalence_failure`,
 `activity_failure`, `timeout`, `path_validation_failure`, `hash_failure`,
 `internal_error`, and `partial_failure`. Selection uses this fixed priority
 (first applicable category wins): `timeout`, `compile_failure`,
-`original_simulation_failure`, `simulation_not_detected`,
+`original_simulation_failure`, `simulation_failure`, `simulation_not_detected`,
 `repaired_simulation_failure`, `lint_failure`, `synthesis_failure`,
 `equivalence_failure`, `activity_failure`, `tool_unavailable`,
 `partial_failure`, `passed`. Thus an attempted failure is never hidden by a
@@ -174,14 +190,20 @@ missing optional tool.
 
 ## Diagnostics and artifact hygiene
 
-Subprocesses use argument arrays with `shell=False`, isolated per-row
-directories under `work_dir`, and bounded timeouts. Diagnostics are capped at
-4096 characters per item, contain command/tool context rather than RTL, and
-replace absolute workspace, work, and manifest paths with `<workspace>`,
-`<work>`, and `<manifest>`. Environment dumps, credentials, raw RTL,
-testbench text, and arbitrary shell strings are not emitted. Generated
-binaries, logs, VCDs, synthesis scripts, scratch directories, private RTL,
-model outputs, and evidence files are ignored/not committed.
+Subprocesses use argument arrays with `shell=False`, bounded timeouts, and
+per-row directories inside a newly created managed run directory beneath
+`work_dir` (with a random `.rtlbench-run-*` name). A pre-existing predictable
+row directory or symlink inside `work_dir` is never used. Diagnostics are
+capped at 4096 characters per item, contain command/tool context rather than
+RTL, replace workspace, managed-run, and manifest paths with `<workspace>`,
+`<work>`, and `<manifest>`, and never expose the random managed-run name.
+Environment dumps, credentials, raw RTL, testbench text, and arbitrary shell
+strings are not emitted. Generated binaries, logs, VCDs, synthesis scripts,
+scratch directories, private RTL, model outputs, and evidence files are
+ignored/not committed. Managed run directories are retained as caller-managed
+scratch for diagnosis; callers should place `--work-dir` outside the repository
+or beneath an ignored scratch path. The verifier never recursively deletes a
+pre-existing directory.
 
 ## Batch, atomic output, and interruption behavior
 

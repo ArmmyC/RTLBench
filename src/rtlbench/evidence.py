@@ -6,13 +6,14 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 EVIDENCE_SCHEMA_VERSION = "rtl_mutation_evidence_v0.1"
 FAILURE_CATEGORIES = (
     "passed",
     "tool_unavailable",
     "compile_failure",
+    "simulation_failure",
     "lint_failure",
     "simulation_not_detected",
     "original_simulation_failure",
@@ -30,6 +31,7 @@ FAILURE_PRIORITY = (
     "timeout",
     "compile_failure",
     "original_simulation_failure",
+    "simulation_failure",
     "simulation_not_detected",
     "repaired_simulation_failure",
     "lint_failure",
@@ -81,11 +83,11 @@ def not_requested() -> dict[str, Any]:
 
 def compute_evidence_tier(
     checks: Mapping[str, Any], hashes_present: bool = True, metadata_valid: bool = True
-) -> str:
-    """Compute A/B/C/D without depending on iteration order or wall-clock data."""
+) -> Literal["A", "B", "C"] | None:
+    """Compute executable evidence tier without using wall-clock data."""
 
     if not metadata_valid or not hashes_present:
-        return "D"
+        return None
     compile_statuses = [
         _get_status(checks, "compile", name)
         for name in ("original", "mutated", "repaired")
@@ -106,24 +108,24 @@ def compute_evidence_tier(
         _get_status(checks, "simulation", "mutated_detects_mutation"),
         _get_status(checks, "simulation", "repaired_passes"),
     ]
+    equivalence = [_get_status(checks, "equivalence", "original_vs_repaired")]
     if all(_is_pass(item) for item in compile_statuses + functional):
         return "A"
 
-    structural_attempted = [item for item in structural_statuses if item.get("attempted")]
-    compilation_attempted = [item for item in compile_statuses if item.get("attempted")]
-    repaired_structural_attempted = [item for item in repaired_structural if item.get("attempted")]
+    repaired_structural_attempted = [
+        item for item in repaired_structural if item.get("attempted") is True
+    ]
     if (
-        compilation_attempted
-        and all(_is_pass(item) for item in compilation_attempted)
-        and structural_attempted
-        and repaired_structural_attempted
+        all(_is_pass(item) for item in compile_statuses)
+        and any(_is_pass(item) for item in structural_statuses)
         and all(_is_pass(item) for item in repaired_structural_attempted)
         and not all(_is_pass(item) for item in functional)
     ):
         return "B"
-    if structural_attempted or compilation_attempted:
+    executable_checks = compile_statuses + structural_statuses + functional + equivalence
+    if any(item.get("attempted") is True for item in executable_checks):
         return "C"
-    return "C"
+    return None
 
 
 def select_failure_category(checks: Mapping[str, Any]) -> str:
@@ -154,10 +156,14 @@ def sanitize_diagnostic(
     """Bound and de-identify tool text before it enters evidence."""
 
     text = str(value).replace("\x00", "")
-    replacements = (
-        (workspace_root, "<workspace>"),
+    replacements = [
         (work_dir, "<work>"),
         (manifest_path, "<manifest>"),
+        (workspace_root, "<workspace>"),
+    ]
+    replacements.sort(
+        key=lambda item: len(str(item[0].resolve())) if item[0] is not None else 0,
+        reverse=True,
     )
     for path, placeholder in replacements:
         if path is not None:
