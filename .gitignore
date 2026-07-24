@@ -11,3 +11,6 @@ benchmarks/*
 !benchmarks/rfid_apbench/**
 logs/*.out
 logs/*.err
+*.rtlbench-partial
+*.vvp
+*.vcd

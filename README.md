@@ -95,6 +95,26 @@ Rows that fail extraction, compile, simulation, synthesis, or metric availabilit
 
 ## Quick Start
 
+### Verify mutation artifacts
+
+RTLBench can verify a strict `rtl_mutation_manifest_v0.1` JSONL manifest
+without contacting a model or network service:
+
+```bash
+rtlbench verify-mutations \
+  --manifest tests/fixtures/mutation_verification/manifest.jsonl \
+  --output /tmp/rtlbench-mutation-evidence.jsonl \
+  --workspace-root tests/fixtures/mutation_verification \
+  --work-dir /tmp/rtlbench-mutation-work \
+  --force
+```
+
+The command validates paths and symlinks, records SHA-256 inputs and local
+tool versions, runs requested checks sequentially, and atomically publishes
+sanitized `rtl_mutation_evidence_v0.1` JSONL. Missing EDA tools remain explicit
+unavailable states rather than passes. See
+`docs/specs/mutation_verification_v0.1.md` for the complete contract.
+
 ### 1. Install
 
 ```bash
