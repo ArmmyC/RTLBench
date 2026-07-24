@@ -47,12 +47,20 @@ def _simulation_fake_tools(
     tmp_path: Path,
     *,
     compile_failure: str | None = None,
-    mutation_detected: bool = True,
+    outputs: dict[str, str] | None = None,
+    returncodes: dict[str, int] | None = None,
 ) -> tuple[Path, Path]:
     bindir = tmp_path / "simulation-bin"
     bindir.mkdir()
     compile_failure_literal = repr(compile_failure)
-    detected_literal = repr(mutation_detected)
+    simulation_outputs = {
+        "original.sv": "Mismatches: 0",
+        "mutated.sv": "Mismatches: 1",
+        "repaired.sv": "Mismatches: 0",
+    }
+    simulation_outputs.update(outputs or {})
+    outputs_literal = repr(simulation_outputs)
+    returncodes_literal = repr(returncodes or {})
     iverilog = bindir / "iverilog"
     iverilog.write_text(
         "#!/usr/bin/env python3\n"
@@ -68,8 +76,10 @@ def _simulation_fake_tools(
         "#!/usr/bin/env python3\n"
         "import pathlib, sys\n"
         "marker = pathlib.Path(sys.argv[1]).read_text()\n"
-        f"if {detected_literal} and marker == 'mutated.sv': print('Mismatches: 1')\n"
-        "else: print('Mismatches: 0')\n",
+        f"outputs = {outputs_literal}\n"
+        f"returncodes = {returncodes_literal}\n"
+        "print(outputs[marker])\n"
+        "raise SystemExit(returncodes.get(marker, 0))\n",
         encoding="utf-8",
     )
     for path in (iverilog, vvp):
@@ -81,7 +91,8 @@ def _simulation_evidence(
     tmp_path: Path,
     *,
     compile_failure: str | None = None,
-    mutation_detected: bool = True,
+    outputs: dict[str, str] | None = None,
+    returncodes: dict[str, int] | None = None,
 ) -> dict:
     row = load_manifest(FIXTURE / "manifest.jsonl", FIXTURE)[0]
     row = replace(
@@ -98,7 +109,8 @@ def _simulation_evidence(
     iverilog, vvp = _simulation_fake_tools(
         tmp_path,
         compile_failure=compile_failure,
-        mutation_detected=mutation_detected,
+        outputs=outputs,
+        returncodes=returncodes,
     )
     toolchain = {
         "iverilog": verification.ToolInfo(str(iverilog), None),
@@ -151,18 +163,71 @@ def test_simulation_compile_failure_is_compile_failure(
     assert evidence["failure_category"] == "compile_failure"
 
 
-def test_mutated_simulation_success_without_detection_is_not_detected(tmp_path: Path):
-    evidence = _simulation_evidence(tmp_path, mutation_detected=False)
+def test_mutated_mismatch_count_detects_even_with_nonzero_exit(tmp_path: Path):
+    evidence = _simulation_evidence(
+        tmp_path,
+        returncodes={"mutated.sv": 1},
+    )
+    leaf = evidence["checks"]["simulation"]["mutated_detects_mutation"]
+    assert leaf == {"attempted": True, "passed": True, "reason": None}
+    assert evidence["failure_category"] == "passed"
+
+
+@pytest.mark.parametrize("returncode", [0, 1])
+def test_mutated_zero_mismatch_count_does_not_detect(
+    tmp_path: Path, returncode: int
+):
+    evidence = _simulation_evidence(
+        tmp_path,
+        outputs={"mutated.sv": "Mismatches: 0"},
+        returncodes={"mutated.sv": returncode},
+    )
     leaf = evidence["checks"]["simulation"]["mutated_detects_mutation"]
     assert leaf["reason"] == "simulation_not_detected"
     assert evidence["failure_category"] == "simulation_not_detected"
 
 
-def test_mutated_simulation_mismatch_is_detected(tmp_path: Path):
-    evidence = _simulation_evidence(tmp_path, mutation_detected=True)
+@pytest.mark.parametrize("output", ["ERROR", "FATAL"])
+def test_mutated_generic_failure_with_nonzero_exit_is_simulation_failure(
+    tmp_path: Path, output: str
+):
+    evidence = _simulation_evidence(
+        tmp_path,
+        outputs={"mutated.sv": output},
+        returncodes={"mutated.sv": 1},
+    )
     leaf = evidence["checks"]["simulation"]["mutated_detects_mutation"]
-    assert leaf == {"attempted": True, "passed": True, "reason": None}
-    assert evidence["failure_category"] == "passed"
+    assert leaf["reason"] == "simulation_failure"
+    assert evidence["failure_category"] == "simulation_failure"
+
+
+def test_mutated_generic_failure_with_zero_exit_does_not_detect(tmp_path: Path):
+    evidence = _simulation_evidence(
+        tmp_path,
+        outputs={"mutated.sv": "failure"},
+    )
+    leaf = evidence["checks"]["simulation"]["mutated_detects_mutation"]
+    assert leaf["reason"] == "simulation_not_detected"
+    assert evidence["failure_category"] == "simulation_not_detected"
+
+
+@pytest.mark.parametrize(
+    ("artifact", "meaning", "reason"),
+    [
+        ("original.sv", "original_passes", "original_simulation_failure"),
+        ("repaired.sv", "repaired_passes", "repaired_simulation_failure"),
+    ],
+)
+def test_original_and_repaired_positive_mismatch_counts_fail(
+    tmp_path: Path, artifact: str, meaning: str, reason: str
+):
+    evidence = _simulation_evidence(
+        tmp_path,
+        outputs={artifact: "Mismatches: 2"},
+    )
+    leaf = evidence["checks"]["simulation"][meaning]
+    assert leaf["reason"] == reason
+    assert evidence["failure_category"] == reason
 
 
 def test_discovered_tool_remains_available_when_version_probe_fails(tmp_path: Path):

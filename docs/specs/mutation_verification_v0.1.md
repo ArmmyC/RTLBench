@@ -139,18 +139,34 @@ or `{attempted: false, passed: null, reason: "not_requested"|"tool_unavailable"|
 Optional deterministic `duration_ms` is not used, so wall-clock timing never
 changes evidence output.
 
-Simulation uses the same Icarus testbench for all three artifacts. Detection
-requires successful mutated compilation, testbench execution, and a semantic
-mismatch/nonzero testbench result recognized from mismatch/failure output. A
-simulation compilation startup error or nonzero compilation return code is
-`compile_failure` for original, mutated, and repaired artifacts. A compilation
-timeout remains `timeout`. A post-compilation simulation startup error or
-unrecognized nonzero simulation return code is `simulation_failure` for the
-mutated artifact, while original and repaired execution failures use their
-artifact-specific categories. An unexpectedly passing mutation is
-`simulation_not_detected` only after compilation and simulation execution
-succeed without a recognized mismatch or semantic failure. Repaired
-simulation must pass.
+Simulation uses the same Icarus testbench for all three artifacts. The
+machine-readable mismatch contract is one or more complete output lines of
+the form:
+
+```text
+Mismatches: <non-negative decimal integer>
+```
+
+Leading/trailing horizontal whitespace is allowed; the label is matched
+case-insensitively. Only these lines provide mismatch evidence. All reported
+counts are collected, and generic words such as `error`, `fatal`, `failure`,
+or `mismatch` without this count format do not provide evidence.
+
+Detection requires successful mutated compilation and testbench execution. A
+positive reported mismatch count detects the mutation regardless of the
+simulation return code. A reported count of zero yields
+`simulation_not_detected`; with no mismatch count, a zero return code also
+yields `simulation_not_detected`, while a nonzero return code yields
+`simulation_failure`. A simulation startup error is `simulation_failure` and
+a simulation timeout remains `timeout`.
+
+For original and repaired artifacts, simulation passes only when the return
+code is zero and every reported mismatch count is zero. Any positive count or
+nonzero return without mismatch evidence is the relevant
+`original_simulation_failure` or `repaired_simulation_failure`. A simulation
+compilation startup error or nonzero compilation return code is
+`compile_failure` for original, mutated, and repaired artifacts; a compilation
+timeout remains `timeout`.
 
 Synthesis is independent generic Yosys parsing/synthesis and is never called
 functional correctness. Equivalence compares original versus repaired only;

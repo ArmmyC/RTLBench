@@ -51,14 +51,28 @@ class CommandResult:
     startup_error: bool = False
 
 
+@dataclass(frozen=True)
+class MismatchReport:
+    """Machine-readable mismatch counts reported by a simulation."""
+
+    counts: tuple[int, ...]
+
+    @property
+    def has_count(self) -> bool:
+        return bool(self.counts)
+
+    @property
+    def has_positive_count(self) -> bool:
+        return any(count > 0 for count in self.counts)
+
+
 TOOL_VERSION_ARGS = {
     "iverilog": ("-V",),
     "vvp": ("-V",),
     "verilator": ("--version",),
     "yosys": ("--version",),
 }
-_MISMATCH_RE = re.compile(r"mismatches?\s*[:=]\s*(\d+)", re.IGNORECASE)
-_FAILURE_RE = re.compile(r"\b(?:fail(?:ed|ure)?|error|fatal|mismatch)\b", re.IGNORECASE)
+_MISMATCH_COUNT_RE = re.compile(r"(?im)^[ \t]*Mismatches[ \t]*:[ \t]*(\d+)[ \t]*\r?$")
 
 
 def discover_toolchain(timeout: float = 5.0, which: Callable[[str], str | None] | None = None) -> dict[str, ToolInfo]:
@@ -371,20 +385,21 @@ def _simulate_design(
     simulated = _run([vvp, str(binary)], cwd, timeout)
     if simulated.timed_out:
         return failed("timeout"), _diagnostic("simulation", simulated, workspace_root, cwd, manifest_path)
-    output = simulated.output
-    semantic_failure = _semantic_failure(output)
+    mismatch_report = _parse_mismatch_report(simulated.output)
     if meaning == "mutated_detects_mutation":
         if simulated.startup_error:
             return failed("simulation_failure"), _diagnostic("simulation", simulated, workspace_root, cwd, manifest_path)
-        if semantic_failure:
+        if mismatch_report.has_positive_count:
             return passed(), _diagnostic("simulation", simulated, workspace_root, cwd, manifest_path, only_if_output=True)
+        if mismatch_report.has_count:
+            return failed("simulation_not_detected"), _diagnostic("simulation", simulated, workspace_root, cwd, manifest_path)
         if simulated.returncode != 0:
             return failed("simulation_failure"), _diagnostic("simulation", simulated, workspace_root, cwd, manifest_path)
         return failed("simulation_not_detected"), _diagnostic("simulation", simulated, workspace_root, cwd, manifest_path)
     if simulated.startup_error:
         reason = "original_simulation_failure" if meaning == "original_passes" else "repaired_simulation_failure"
         return failed(reason), _diagnostic("simulation", simulated, workspace_root, cwd, manifest_path)
-    if simulated.returncode == 0 and not semantic_failure:
+    if simulated.returncode == 0 and not mismatch_report.has_positive_count:
         return passed(), _diagnostic("simulation", simulated, workspace_root, cwd, manifest_path, only_if_output=True)
     reason = "original_simulation_failure" if meaning == "original_passes" else "repaired_simulation_failure"
     return failed(reason), _diagnostic("simulation", simulated, workspace_root, cwd, manifest_path)
@@ -502,9 +517,12 @@ def _capture_version(path: str, args: tuple[str, ...], timeout: float) -> str | 
     return sanitize_diagnostic(value, limit=512) or None
 
 
-def _semantic_failure(output: str) -> bool:
-    counts = [int(value) for value in _MISMATCH_RE.findall(output)]
-    return any(value > 0 for value in counts) or bool(_FAILURE_RE.search(output))
+def _parse_mismatch_report(output: str) -> MismatchReport:
+    """Parse only complete machine-readable mismatch-count lines."""
+
+    return MismatchReport(
+        tuple(int(value) for value in _MISMATCH_COUNT_RE.findall(output))
+    )
 
 
 def _diagnostic(
