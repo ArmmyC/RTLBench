@@ -17,7 +17,7 @@ module tb;
     a = 0; b = 1; check(0);
     a = 1; b = 0; check(0);
     a = 1; b = 1; check(1);
-    $display("Mismatches: %0d", mismatches);
+    $display("Mismatches: %0d in 4 samples", mismatches);
     if (mismatches != 0) $fatal(1, "functional failure");
     $finish;
   end

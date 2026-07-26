@@ -115,6 +115,16 @@ copied into evidence. Generated RTL and raw tool artifacts must not be
 committed. See `docs/specs/candidate_verification_v0.1.md` for the complete
 contract.
 
+#### Candidate execution security
+
+Generated RTL is executable simulator input. Path validation and diagnostic
+sanitization are not an operating-system sandbox. Evaluate teacher-generated
+candidates inside a disposable, least-privileged container or VM with no
+network access; keep the workspace read-only except for managed scratch, omit
+production secrets, and apply CPU, memory, process, output, disk, and time
+limits externally. This command does not implement a universal sandbox, so
+host execution must not be considered safe merely because paths are validated.
+
 ### Verify mutation artifacts
 
 RTLBench can verify a strict `rtl_mutation_manifest_v0.1` JSONL manifest

@@ -5,10 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -29,9 +32,15 @@ TOOL_VERSION_ARGS = {
     "yosys": ("--version",),
 }
 _TOOL_NAMES = ("iverilog", "vvp", "verilator", "yosys")
-_MISMATCH_COUNT_RE = re.compile(
+DEFAULT_MAX_OUTPUT_BYTES = 65_536
+MAX_OUTPUT_BYTES_LIMIT = 4 * 1024 * 1024
+_MISMATCH_LONG_RE = re.compile(
+    r"(?im)^[ \t]*mismatches[ \t]*:[ \t]*([0-9]+)[ \t]+in[ \t]+([0-9]+)[ \t]+samples[ \t]*\r?$"
+)
+_MISMATCH_SHORT_RE = re.compile(
     r"(?im)^[ \t]*mismatches[ \t]*:[ \t]*([0-9]+)[ \t]*\r?$"
 )
+_TIMEOUT_RE = re.compile(r"(?im)^[ \t]*timeout[ \t]*\r?$")
 _MANAGED_RUN_RE = re.compile(r"\.rtlbench-run-[A-Za-z0-9_.-]+")
 
 
@@ -62,28 +71,55 @@ class CommandResult:
     output: str
     timed_out: bool = False
     startup_error: bool = False
+    output_limit_exceeded: bool = False
 
 
 @dataclass(frozen=True)
 class MismatchReport:
-    counts: tuple[int, ...]
+    contract: str
+    reported_counts: tuple[int, ...]
+    reported_sample_counts: tuple[int | None, ...]
+    timeout_reported: bool = False
 
     @property
     def has_positive_count(self) -> bool:
-        return any(count > 0 for count in self.counts)
+        return any(count > 0 for count in self.reported_counts)
+
+    @property
+    def maximum_count(self) -> int | None:
+        return max(self.reported_counts) if self.reported_counts else None
+
+    @property
+    def has_report(self) -> bool:
+        return bool(self.reported_counts)
 
 
 def discover_toolchain(
     timeout: float = 5.0,
     which: Callable[[str], str | None] | None = None,
+    cwd: Path | None = None,
+    environment: Mapping[str, str] | None = None,
+    max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
 ) -> dict[str, ToolInfo]:
     """Discover and version each executable once for a verification run."""
 
     resolver = which or shutil.which
+    probe_cwd = cwd or Path.cwd()
     result: dict[str, ToolInfo] = {}
     for name in _TOOL_NAMES:
         path = resolver(name)
-        version = _capture_version(path, TOOL_VERSION_ARGS[name], timeout) if path else None
+        version = (
+            _capture_version(
+                path,
+                TOOL_VERSION_ARGS[name],
+                timeout,
+                probe_cwd,
+                environment,
+                max_output_bytes,
+            )
+            if path
+            else None
+        )
         result[name] = ToolInfo(path, version)
     return result
 
@@ -127,11 +163,14 @@ def verify_candidates(
     work_dir: Path,
     timeout: float = 30.0,
     force: bool = False,
+    max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+    environment: Mapping[str, str] | None = None,
 ) -> dict[str, int]:
     """Validate, execute, and atomically publish deterministic candidate evidence."""
 
     if timeout <= 0:
         raise CandidateManifestValidationError("timeout must be greater than zero")
+    _validate_max_output_bytes(max_output_bytes)
     try:
         rows = load_manifest(Path(manifest), Path(workspace_root))
     except KeyboardInterrupt as exc:
@@ -158,7 +197,12 @@ def verify_candidates(
         ) from exc
 
     try:
-        toolchain = discover_toolchain(timeout=timeout)
+        toolchain = discover_toolchain(
+            timeout=timeout,
+            cwd=scratch,
+            environment=environment,
+            max_output_bytes=max_output_bytes,
+        )
     except KeyboardInterrupt as exc:
         raise CandidateVerificationInterrupted(
             f"interrupted; partial evidence retained at {partial_path}"
@@ -182,6 +226,8 @@ def verify_candidates(
                         row_index=index,
                         workspace_root=Path(workspace_root),
                         manifest_path=Path(manifest),
+                        max_output_bytes=max_output_bytes,
+                        environment=environment,
                     )
                 except KeyboardInterrupt:
                     raise
@@ -193,6 +239,7 @@ def verify_candidates(
                         str(exc),
                         Path(workspace_root),
                         scratch,
+                        Path(manifest),
                     )
                 handle.write(deterministic_json(evidence) + "\n")
                 handle.flush()
@@ -223,7 +270,10 @@ def verify_row(
     row_index: int = 1,
     workspace_root: Path | None = None,
     manifest_path: Path | None = None,
+    max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+    environment: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
+    _validate_max_output_bytes(max_output_bytes)
     row_work = work_dir / (
         f"{row_index:06d}_{_safe_name(row.candidate_id)}_"
         f"{hashlib.sha256(row.candidate_id.encode()).hexdigest()[:12]}"
@@ -231,7 +281,7 @@ def verify_row(
     row_work.mkdir(parents=True, exist_ok=True)
     checks = _initial_checks(row.requested_checks)
     diagnostics: list[str] = []
-    mismatch_counts: list[int] = []
+    report = MismatchReport(row.simulation_result_contract, (), (), False)
     artifact_paths = [path for _, path in row.artifact_paths]
 
     iverilog = toolchain["iverilog"].path
@@ -249,6 +299,8 @@ def verify_row(
             workspace_root,
             manifest_path,
             artifact_paths,
+            max_output_bytes,
+            environment,
         )
         checks["compile"]["candidate"] = compile_status
         if diagnostic:
@@ -271,9 +323,10 @@ def verify_row(
                 workspace_root,
                 manifest_path,
                 artifact_paths,
+                max_output_bytes,
+                environment,
             )
             checks["simulation"]["candidate_passes"] = simulation_status
-            mismatch_counts.extend(report.counts)
             if diagnostic:
                 diagnostics.append(diagnostic)
 
@@ -290,6 +343,8 @@ def verify_row(
                 workspace_root,
                 manifest_path,
                 artifact_paths,
+                max_output_bytes,
+                environment,
             )
             checks["lint"]["candidate"] = status
             if diagnostic:
@@ -308,6 +363,8 @@ def verify_row(
                 workspace_root,
                 manifest_path,
                 artifact_paths,
+                max_output_bytes,
+                environment,
             )
             checks["synthesis"]["candidate"] = status
             if diagnostic:
@@ -323,13 +380,18 @@ def verify_row(
         "source_id": row.source_id,
         "attempt": row.attempt,
         "top_module": row.top_module,
+        "testbench_top": row.testbench_top,
+        "simulation_result_contract": row.simulation_result_contract,
         "requested_checks": dict(row.requested_checks),
         "input_hashes": input_hashes,
         "toolchain": toolchain_json(toolchain),
         "checks": checks,
         "mismatch_summary": {
-            "reported_counts": mismatch_counts,
-            "maximum_count": max(mismatch_counts) if mismatch_counts else None,
+            "contract": report.contract,
+            "reported_counts": list(report.reported_counts),
+            "reported_sample_counts": list(report.reported_sample_counts),
+            "maximum_count": report.maximum_count,
+            "timeout_reported": report.timeout_reported,
         },
         "failure_category": _select_failure_category(checks, accepted),
         "accepted": accepted,
@@ -368,6 +430,8 @@ def _compile_design(
     workspace_root: Path | None,
     manifest_path: Path | None,
     artifact_paths: list[Path],
+    max_output_bytes: int,
+    environment: Mapping[str, str] | None,
 ) -> tuple[dict[str, Any], str | None]:
     command = [
         iverilog,
@@ -379,12 +443,12 @@ def _compile_design(
         str(row.resolved_paths["candidate_rtl_path"]),
     ]
     command.extend(str(row.resolved_support_paths[path]) for path in row.support_files)
-    result = _run(command, cwd, timeout)
+    result = _run(command, cwd, timeout, max_output_bytes, environment)
     if result.timed_out:
         return _failed("timeout"), _diagnostic(
             "compile", result, workspace_root, cwd, manifest_path, artifact_paths
         )
-    if result.startup_error or result.returncode != 0:
+    if result.output_limit_exceeded or result.startup_error or result.returncode != 0:
         return _failed("compile_failure"), _diagnostic(
             "compile", result, workspace_root, cwd, manifest_path, artifact_paths
         )
@@ -409,21 +473,25 @@ def _simulate_design(
     workspace_root: Path | None,
     manifest_path: Path | None,
     artifact_paths: list[Path],
+    max_output_bytes: int,
+    environment: Mapping[str, str] | None,
 ) -> tuple[dict[str, Any], MismatchReport, str | None]:
     compile_command = [
         iverilog,
         "-g2012",
+        "-s",
+        row.testbench_top,
         "-o",
         str(binary),
         str(row.resolved_paths["candidate_rtl_path"]),
     ]
     compile_command.extend(str(row.resolved_support_paths[path]) for path in row.support_files)
     compile_command.append(str(row.resolved_paths["testbench_path"]))
-    compiled = _run(compile_command, cwd, timeout)
+    compiled = _run(compile_command, cwd, timeout, max_output_bytes, environment)
     if compiled.timed_out:
         return (
             _failed("timeout"),
-            MismatchReport(()),
+            MismatchReport(row.simulation_result_contract, (), (), False),
             _diagnostic(
                 "simulation compile",
                 compiled,
@@ -433,10 +501,10 @@ def _simulate_design(
                 artifact_paths,
             ),
         )
-    if compiled.startup_error or compiled.returncode != 0:
+    if compiled.output_limit_exceeded or compiled.startup_error or compiled.returncode != 0:
         return (
             _failed("compile_failure"),
-            MismatchReport(()),
+            MismatchReport(row.simulation_result_contract, (), (), False),
             _diagnostic(
                 "simulation compile",
                 compiled,
@@ -447,8 +515,8 @@ def _simulate_design(
             ),
         )
 
-    simulated = _run([vvp, str(binary)], cwd, timeout)
-    report = _parse_mismatch_report(simulated.output)
+    simulated = _run([vvp, str(binary)], cwd, timeout, max_output_bytes, environment)
+    report = _parse_mismatch_report(simulated.output, row.simulation_result_contract)
     if simulated.timed_out:
         return (
             _failed("timeout"),
@@ -462,9 +530,35 @@ def _simulate_design(
                 artifact_paths,
             ),
         )
-    if simulated.startup_error:
+    if report.timeout_reported:
+        return (
+            _failed("timeout"),
+            report,
+            _diagnostic(
+                "simulation",
+                simulated,
+                workspace_root,
+                cwd,
+                manifest_path,
+                artifact_paths,
+            ),
+        )
+    if simulated.output_limit_exceeded or simulated.startup_error:
         return (
             _failed("simulation_failure"),
+            report,
+            _diagnostic(
+                "simulation",
+                simulated,
+                workspace_root,
+                cwd,
+                manifest_path,
+                artifact_paths,
+            ),
+        )
+    if row.simulation_result_contract == "mismatch_count_v1" and not report.has_report:
+        return (
+            _failed("simulation_result_missing"),
             report,
             _diagnostic(
                 "simulation",
@@ -512,6 +606,8 @@ def _lint_design(
     workspace_root: Path | None,
     manifest_path: Path | None,
     artifact_paths: list[Path],
+    max_output_bytes: int,
+    environment: Mapping[str, str] | None,
 ) -> tuple[dict[str, Any], str | None]:
     command = [
         verilator,
@@ -522,12 +618,12 @@ def _lint_design(
         str(row.resolved_paths["candidate_rtl_path"]),
     ]
     command.extend(str(row.resolved_support_paths[path]) for path in row.support_files)
-    result = _run(command, cwd, timeout)
+    result = _run(command, cwd, timeout, max_output_bytes, environment)
     if result.timed_out:
         return _failed("timeout"), _diagnostic(
             "lint", result, workspace_root, cwd, manifest_path, artifact_paths
         )
-    if result.startup_error or result.returncode != 0:
+    if result.output_limit_exceeded or result.startup_error or result.returncode != 0:
         return _failed("lint_failure"), _diagnostic(
             "lint", result, workspace_root, cwd, manifest_path, artifact_paths
         )
@@ -550,6 +646,8 @@ def _synthesize_design(
     workspace_root: Path | None,
     manifest_path: Path | None,
     artifact_paths: list[Path],
+    max_output_bytes: int,
+    environment: Mapping[str, str] | None,
 ) -> tuple[dict[str, Any], str | None]:
     script = cwd / "candidate_synthesis.ys"
     files = [
@@ -564,12 +662,12 @@ def _synthesize_design(
         + "\n",
         encoding="utf-8",
     )
-    result = _run([yosys, str(script)], cwd, timeout)
+    result = _run([yosys, str(script)], cwd, timeout, max_output_bytes, environment)
     if result.timed_out:
         return _failed("timeout"), _diagnostic(
             "synthesis", result, workspace_root, cwd, manifest_path, artifact_paths
         )
-    if result.startup_error or result.returncode != 0:
+    if result.output_limit_exceeded or result.startup_error or result.returncode != 0:
         return _failed("synthesis_failure"), _diagnostic(
             "synthesis", result, workspace_root, cwd, manifest_path, artifact_paths
         )
@@ -584,39 +682,183 @@ def _synthesize_design(
     )
 
 
-def _run(command: list[str], cwd: Path, timeout: float) -> CommandResult:
+def _run(
+    command: list[str],
+    cwd: Path,
+    timeout: float,
+    max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+    environment: Mapping[str, str] | None = None,
+) -> CommandResult:
+    _validate_max_output_bytes(max_output_bytes)
+    child_environment = _minimal_environment(cwd, environment)
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             command,
             cwd=cwd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=child_environment,
             shell=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return CommandResult(
-            None,
-            f"{exc.stdout or ''}\n{exc.stderr or ''}",
-            timed_out=True,
         )
     except OSError as exc:
         return CommandResult(None, str(exc), startup_error=True)
-    return CommandResult(completed.returncode, f"{completed.stdout}\n{completed.stderr}")
+
+    output_queue: queue.Queue[bytes] = queue.Queue(maxsize=16)
+    reader_done = threading.Event()
+
+    def drain_output() -> None:
+        try:
+            if process.stdout is None:
+                return
+            while True:
+                chunk = process.stdout.read(8192)
+                if not chunk:
+                    return
+                output_queue.put(chunk)
+        finally:
+            reader_done.set()
+
+    reader = threading.Thread(target=drain_output, name="rtlbench-output-reader", daemon=True)
+    reader.start()
+    output = bytearray()
+    timed_out = False
+    output_limit_exceeded = False
+    deadline = time.monotonic() + timeout
+
+    def collect(chunk: bytes) -> None:
+        nonlocal output_limit_exceeded
+        remaining = max_output_bytes - len(output)
+        if len(chunk) > remaining:
+            output_limit_exceeded = True
+            if remaining > 0:
+                output.extend(chunk[:remaining])
+        else:
+            output.extend(chunk)
+
+    try:
+        while True:
+            if process.poll() is not None and reader_done.is_set() and output_queue.empty():
+                break
+            remaining_time = deadline - time.monotonic()
+            if remaining_time <= 0:
+                timed_out = True
+                _terminate_process(process)
+                break
+            try:
+                chunk = output_queue.get(timeout=min(remaining_time, 0.05))
+            except queue.Empty:
+                continue
+            collect(chunk)
+            if output_limit_exceeded:
+                _terminate_process(process)
+                break
+
+        drain_deadline = time.monotonic() + 1.0
+        while time.monotonic() < drain_deadline and (
+            not reader_done.is_set() or not output_queue.empty()
+        ):
+            try:
+                collect(output_queue.get(timeout=0.05))
+            except queue.Empty:
+                pass
+        try:
+            returncode = process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            _terminate_process(process)
+            returncode = process.wait(timeout=1.0)
+    except KeyboardInterrupt:
+        _terminate_process(process)
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
+        raise
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+    return CommandResult(
+        returncode,
+        bytes(output).decode("utf-8", errors="replace"),
+        timed_out=timed_out,
+        output_limit_exceeded=output_limit_exceeded,
+    )
 
 
-def _capture_version(path: str, args: tuple[str, ...], timeout: float) -> str | None:
-    result = _run([path, *args], Path.cwd(), timeout)
+def _terminate_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+def _minimal_environment(
+    cwd: Path,
+    extra: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    environment = {
+        "PATH": os.defpath,
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "TMPDIR": str(cwd),
+        "TEMP": str(cwd),
+        "TMP": str(cwd),
+        "HOME": str(cwd),
+    }
+    if os.name == "nt" and os.environ.get("SystemRoot"):
+        environment["SystemRoot"] = os.environ["SystemRoot"]
+    if extra:
+        # ``extra`` is intentionally an explicit test hook.  Preserve the
+        # scratch-directed values even if a caller accidentally supplies them.
+        for key, value in extra.items():
+            key = str(key)
+            if key not in {"PATH", "TMPDIR", "TEMP", "TMP", "HOME", "SystemRoot"}:
+                environment[key] = str(value)
+    return environment
+
+
+def _capture_version(
+    path: str,
+    args: tuple[str, ...],
+    timeout: float,
+    cwd: Path | None = None,
+    environment: Mapping[str, str] | None = None,
+    max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+) -> str | None:
+    probe_cwd = cwd or Path.cwd()
+    result = _run(
+        [path, *args],
+        probe_cwd,
+        timeout,
+        max_output_bytes,
+        environment,
+    )
     if result.timed_out or result.startup_error or result.returncode != 0:
         return None
     return sanitize_diagnostic(" ".join(result.output.split()), limit=512) or None
 
 
-def _parse_mismatch_report(output: str) -> MismatchReport:
-    return MismatchReport(tuple(int(value) for value in _MISMATCH_COUNT_RE.findall(output)))
+def _parse_mismatch_report(output: str, contract: str) -> MismatchReport:
+    matches: list[tuple[int, int, int | None]] = []
+    for match in _MISMATCH_LONG_RE.finditer(output):
+        matches.append((match.start(), int(match.group(1)), int(match.group(2))))
+    for match in _MISMATCH_SHORT_RE.finditer(output):
+        matches.append((match.start(), int(match.group(1)), None))
+    matches.sort(key=lambda item: item[0])
+    return MismatchReport(
+        contract,
+        tuple(item[1] for item in matches),
+        tuple(item[2] for item in matches),
+        bool(_TIMEOUT_RE.search(output)),
+    )
+
+
+def _validate_max_output_bytes(value: int) -> None:
+    if type(value) is not int or not 0 < value <= MAX_OUTPUT_BYTES_LIMIT:
+        raise CandidateManifestValidationError(
+            f"max-output-bytes must be between 1 and {MAX_OUTPUT_BYTES_LIMIT}"
+        )
 
 
 def _diagnostic(
@@ -629,9 +871,11 @@ def _diagnostic(
     *,
     only_if_output: bool = False,
 ) -> str | None:
-    if only_if_output and not result.output.strip():
+    if only_if_output and not result.output.strip() and not result.output_limit_exceeded:
         return None
-    if result.timed_out:
+    if result.output_limit_exceeded:
+        message = f"{stage}: output_limit_exceeded returncode={result.returncode} {result.output}"
+    elif result.timed_out:
         message = f"{stage}: timeout"
     elif result.startup_error:
         message = f"{stage}: process_start_failed"
@@ -697,6 +941,7 @@ def _select_failure_category(checks: Mapping[str, Any], accepted: bool) -> str:
         "timeout",
         "compile_failure",
         "functional_mismatch",
+        "simulation_result_missing",
         "simulation_failure",
         "tool_unavailable",
         "internal_error",
@@ -713,6 +958,7 @@ def _internal_evidence(
     error: str,
     workspace_root: Path,
     work_dir: Path,
+    manifest_path: Path | None = None,
 ) -> dict[str, Any]:
     checks = _initial_checks(row.requested_checks)
     checks["compile"]["candidate"] = _failed("internal_error")
@@ -724,7 +970,7 @@ def _internal_evidence(
         f"internal row error: {error}",
         workspace_root=workspace_root,
         work_dir=work_dir,
-        manifest_path=None,
+        manifest_path=manifest_path,
         artifact_paths=[path for _, path in row.artifact_paths],
     )
     return {
@@ -734,11 +980,19 @@ def _internal_evidence(
         "source_id": row.source_id,
         "attempt": row.attempt,
         "top_module": row.top_module,
+        "testbench_top": row.testbench_top,
+        "simulation_result_contract": row.simulation_result_contract,
         "requested_checks": dict(row.requested_checks),
         "input_hashes": input_hashes,
         "toolchain": toolchain_json(toolchain),
         "checks": checks,
-        "mismatch_summary": {"reported_counts": [], "maximum_count": None},
+        "mismatch_summary": {
+            "contract": row.simulation_result_contract,
+            "reported_counts": [],
+            "reported_sample_counts": [],
+            "maximum_count": None,
+            "timeout_reported": False,
+        },
         "failure_category": "internal_error",
         "accepted": False,
         "diagnostics": [diagnostic] if diagnostic else [],

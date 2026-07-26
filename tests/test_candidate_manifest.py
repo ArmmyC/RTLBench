@@ -22,9 +22,11 @@ def _row(**overrides):
         "source_id": "source-1",
         "attempt": 1,
         "top_module": "TopModule",
+        "testbench_top": "tb",
         "candidate_rtl_path": "candidate.sv",
         "testbench_path": "testbench.sv",
         "support_files": [],
+        "simulation_result_contract": "mismatch_count_v1",
         "requested_checks": {
             "compile": True,
             "simulation": True,
@@ -77,6 +79,17 @@ def test_schema_errors(tmp_path: Path, content: str, needle: str):
         load_manifest(manifest, root)
 
 
+@pytest.mark.parametrize("field", ["testbench_top", "simulation_result_contract"])
+def test_new_required_fields_cannot_be_omitted(tmp_path: Path, field: str):
+    manifest, root = _workspace(tmp_path)
+    manifest.write_text(
+        json.dumps({key: value for key, value in _row().items() if key != field}) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(CandidateManifestValidationError, match="missing fields"):
+        load_manifest(manifest, root)
+
+
 @pytest.mark.parametrize("field", ["candidate_id", "task_id", "source_id"])
 def test_required_ids_are_nonempty_strings(tmp_path: Path, field: str):
     manifest, root = _workspace(tmp_path)
@@ -119,6 +132,35 @@ def test_top_module_is_an_identifier(tmp_path: Path, top_module: str):
     manifest.write_text(json.dumps(_row(top_module=top_module)) + "\n", encoding="utf-8")
     with pytest.raises(CandidateManifestValidationError, match="top_module"):
         load_manifest(manifest, root)
+
+
+@pytest.mark.parametrize("field", ["testbench_top"])
+@pytest.mark.parametrize("value", ["", "bad-name", "1top", "a b", "a\\b"])
+def test_testbench_top_is_an_identifier(tmp_path: Path, field: str, value: str):
+    manifest, root = _workspace(tmp_path)
+    manifest.write_text(json.dumps(_row(**{field: value})) + "\n", encoding="utf-8")
+    with pytest.raises(CandidateManifestValidationError, match=field):
+        load_manifest(manifest, root)
+
+
+@pytest.mark.parametrize("contract", ["", "unknown", "mismatch_count_v2"])
+def test_simulation_result_contract_is_supported(tmp_path: Path, contract: str):
+    manifest, root = _workspace(tmp_path)
+    manifest.write_text(
+        json.dumps(_row(simulation_result_contract=contract)) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(CandidateManifestValidationError, match="simulation_result_contract"):
+        load_manifest(manifest, root)
+
+
+def test_exit_code_result_contract_is_accepted(tmp_path: Path):
+    manifest, root = _workspace(tmp_path)
+    manifest.write_text(
+        json.dumps(_row(simulation_result_contract="exit_code_v1")) + "\n",
+        encoding="utf-8",
+    )
+    assert load_manifest(manifest, root)[0].simulation_result_contract == "exit_code_v1"
 
 
 @pytest.mark.parametrize(
@@ -199,6 +241,38 @@ def test_symlinked_artifact_and_workspace_root_are_rejected(tmp_path: Path):
     manifest.write_text(json.dumps(_row()) + "\n", encoding="utf-8")
     with pytest.raises(CandidateWorkspaceValidationError, match="workspace-root"):
         load_manifest(manifest, linked_root)
+
+
+@pytest.mark.skipif(not hasattr(os, "link"), reason="hard links unavailable")
+@pytest.mark.parametrize(
+    "candidate_rtl_path,testbench_path,support_files",
+    [
+        ("candidate.sv", "hardlink.sv", []),
+        ("candidate.sv", "testbench.sv", ["hardlink.sv"]),
+        ("candidate.sv", "testbench.sv", ["support.sv", "hardlink.sv"]),
+    ],
+)
+def test_filesystem_artifact_aliases_are_rejected(
+    tmp_path: Path,
+    candidate_rtl_path: str,
+    testbench_path: str,
+    support_files: list[str],
+):
+    manifest, root = _workspace(tmp_path)
+    os.link(root / "candidate.sv", root / "hardlink.sv")
+    manifest.write_text(
+        json.dumps(
+            _row(
+                candidate_rtl_path=candidate_rtl_path,
+                testbench_path=testbench_path,
+                support_files=support_files,
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(CandidateManifestValidationError, match="alias"):
+        load_manifest(manifest, root)
 
 
 def test_empty_manifest_is_rejected(tmp_path: Path):

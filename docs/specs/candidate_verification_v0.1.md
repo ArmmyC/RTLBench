@@ -51,9 +51,11 @@ Each nonblank line is a JSON object with exactly these fields:
   "source_id": "Prob001_zero",
   "attempt": 1,
   "top_module": "TopModule",
+  "testbench_top": "tb",
   "candidate_rtl_path": "rtlgen_prob001/attempt_01/candidate.sv",
   "testbench_path": "rtlgen_prob001/testbench.sv",
   "support_files": [],
+  "simulation_result_contract": "mismatch_count_v1",
   "requested_checks": {
     "compile": true,
     "simulation": true,
@@ -66,21 +68,27 @@ Each nonblank line is a JSON object with exactly these fields:
 The schema version is exact. IDs and `source_id` are non-empty strings;
 `candidate_id` is globally unique; `(task_id, attempt)` is also unique;
 `attempt` is an integer at least 1; and `top_module` is a valid
-Verilog/SystemVerilog identifier. Unknown or missing fields, type coercion,
-duplicate support paths, role-path collisions, and disabled compile or
-simulation gates are rejected.
+Verilog/SystemVerilog identifier. `testbench_top` is a required identifier
+used only as the simulation elaboration root; it is never inferred from the
+candidate. `simulation_result_contract` is exactly `mismatch_count_v1` or
+`exit_code_v1`. Unknown or missing fields, type coercion, duplicate support
+paths, role-path collisions, and disabled compile or simulation gates are
+rejected.
 
 Artifact paths are normalized POSIX relative paths below `workspace_root`.
 Absolute POSIX and Windows-drive paths, backslashes, NULs, empty components,
 `.`/`..`, escapes, missing files, directories, symlinked workspace roots, and
-symlinked existing path components are rejected.
+symlinked existing path components are rejected. Candidate, testbench, and
+support files are compared after resolution; identical paths, hard links, and
+duplicate inodes are rejected even when their manifest strings differ.
 
 ## Evidence contract
 
 One object is emitted for every valid manifest row. The exact top-level fields
 are `schema_version`, `candidate_id`, `task_id`, `source_id`, `attempt`,
-`top_module`, `requested_checks`, `input_hashes`, `toolchain`, `checks`,
-`mismatch_summary`, `failure_category`, `accepted`, and `diagnostics`.
+`top_module`, `testbench_top`, `simulation_result_contract`,
+`requested_checks`, `input_hashes`, `toolchain`, `checks`, `mismatch_summary`,
+`failure_category`, `accepted`, and `diagnostics`.
 
 SHA-256 hashes are calculated from bytes during preflight before tools run.
 Support hashes are sorted by manifest path. Tool availability and versions are
@@ -122,27 +130,54 @@ iverilog -g2012 -s <top_module> -o <scratch-output>
 
 The private testbench is intentionally excluded from this gate. Functional
 simulation compiles candidate RTL, support files, and the testbench together,
-without guessing the DUT top as the simulation root, then executes the result
-with `vvp`.
+and explicitly selects the declared testbench root:
 
-Only complete, case-insensitive, whitespace-tolerant lines of this form are
-parsed:
+```text
+iverilog -g2012 -s <testbench_top> -o <scratch-output>
+  <candidate RTL> <support files> <testbench>
+```
+
+It then executes the result with `vvp`. The standalone compile gate remains
+`iverilog -g2012 -s <top_module>` and excludes the private testbench.
+
+For `mismatch_count_v1`, only complete, case-insensitive lines with horizontal
+whitespace tolerance in one of these forms are parsed:
 
 ```text
 Mismatches: <non-negative decimal integer>
+Mismatches: <non-negative decimal integer> in <non-negative decimal integer> samples
 ```
 
-All reported counts are retained in output order. `maximum_count` is their
-maximum or `null` when no count was reported. Generic words such as `error`,
-`fatal`, `failure`, or `mismatch` do not count as machine-readable evidence.
+All reported counts and sample counts are retained in output order. A short
+form has a corresponding `null` sample count. The exact deterministic
+`mismatch_summary` shape is:
 
-Simulation passes only when the simulation process starts, returns zero, and
-no reported count is positive. A positive count is always
-`functional_mismatch`, even with a nonzero return code. A zero count or no
-count with return code zero passes. Nonzero return without a positive count is
-`simulation_failure`; simulation startup failure is also
-`simulation_failure`; and simulation compilation failure is `compile_failure`.
-Timeouts are always `timeout`.
+```json
+{
+  "contract": "mismatch_count_v1",
+  "reported_counts": [3],
+  "reported_sample_counts": [40],
+  "maximum_count": 3,
+  "timeout_reported": false
+}
+```
+
+Generic words such as `error`, `fatal`, `failure`, `mismatch`, or prose
+containing `timeout` do not count as machine-readable evidence. The only
+testbench timeout marker is a complete `TIMEOUT` line, recognized
+case-insensitively. A Python subprocess timeout is also reported as
+`timeout`.
+
+With `mismatch_count_v1`, simulation passes only when the process starts,
+returns zero, has no timeout marker, reports at least one supported mismatch
+line, and every count is zero. A positive count is always
+`functional_mismatch`, even with a nonzero return code. A missing report is
+`simulation_result_missing`. Zero counts with a nonzero return are
+`simulation_failure`.
+
+With `exit_code_v1`, a zero return code with no timeout marker and no positive
+recognized count passes; a mismatch report is optional. Timeout evidence has
+priority over counts and process status.
 
 ## Acceptance and failure categories
 
@@ -156,14 +191,16 @@ Lint and synthesis never alter acceptance. A candidate can therefore be
 accepted while its optional lint or synthesis leaf is failed.
 
 The finite candidate categories are `passed`, `tool_unavailable`,
-`compile_failure`, `functional_mismatch`, `simulation_failure`, `timeout`,
-`internal_error`, and `partial_failure`. Required-gate classification uses
+`compile_failure`, `functional_mismatch`, `simulation_result_missing`,
+`simulation_failure`, `timeout`, `internal_error`, and `partial_failure`.
+Required-gate classification uses
 this priority:
 
 ```text
 timeout
 compile_failure
 functional_mismatch
+simulation_result_missing
 simulation_failure
 tool_unavailable
 internal_error
@@ -193,6 +230,26 @@ placeholders. Apparent API keys, tokens, passwords, bearer credentials, and
 secrets are redacted. Source lines and artifact contents are removed. A
 successful testbench's output is not included merely because it printed
 `Mismatches: 0`.
+
+Each tool invocation has a 65,536-byte combined stdout/stderr limit by
+default. The child is terminated when the limit is exceeded and only bounded
+sanitized text is retained; the diagnostic states `output_limit_exceeded`.
+`--max-output-bytes` can lower or raise the limit up to the conservative
+4 MiB cap. Tool subprocesses receive a minimal deterministic environment with
+scratch-directed temporary and home directories. Parent API keys, tokens,
+passwords, cloud credentials, and private application variables are not
+forwarded. This environment reduction is defense-in-depth, not a sandbox.
+
+## Execution security
+
+Generated RTL is executable simulator input. Path validation, bounded process
+output, and diagnostic sanitization are not an operating-system sandbox.
+Teacher-generated candidates must be evaluated inside a disposable,
+least-privileged container or VM with no network access. The workspace should
+be read-only except for managed scratch, no production secrets should be
+present, and CPU, memory, process, output, disk, and time limits should be
+applied externally. This PR does not implement a universal sandbox, and host
+execution must not be treated as safe merely because paths are validated.
 
 ## Filesystem and atomic output behavior
 

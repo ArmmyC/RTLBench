@@ -14,6 +14,8 @@ from rtlbench.candidate_manifest import (
     CandidateWorkspaceValidationError,
 )
 from rtlbench.candidate_verification import (
+    DEFAULT_MAX_OUTPUT_BYTES,
+    MAX_OUTPUT_BYTES_LIMIT,
     CandidateVerificationInternalError,
     CandidateVerificationInterrupted,
     CandidateVerificationPreflightError,
@@ -72,6 +74,7 @@ def build_verify_candidates_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workspace-root", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--max-output-bytes", type=int, default=DEFAULT_MAX_OUTPUT_BYTES)
     parser.add_argument("--force", action="store_true")
     return parser
 
@@ -106,6 +109,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.timeout <= 0:
             print("timeout must be greater than zero", file=sys.stderr)
             return 2
+        if args.max_output_bytes <= 0 or args.max_output_bytes > MAX_OUTPUT_BYTES_LIMIT:
+            print(
+                f"max-output-bytes must be between 1 and {MAX_OUTPUT_BYTES_LIMIT}",
+                file=sys.stderr,
+            )
+            return 2
         try:
             summary = verify_candidates(
                 manifest=args.manifest,
@@ -114,6 +123,7 @@ def main(argv: list[str] | None = None) -> int:
                 work_dir=args.work_dir,
                 timeout=args.timeout,
                 force=args.force,
+                max_output_bytes=args.max_output_bytes,
             )
         except CandidateVerificationInterrupted as exc:
             print(str(exc), file=sys.stderr)

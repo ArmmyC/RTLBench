@@ -11,6 +11,7 @@ from typing import Any
 
 MANIFEST_SCHEMA_VERSION = "rtl_candidate_manifest_v0.1"
 REQUESTED_CHECKS = ("compile", "simulation", "lint", "synthesis")
+SIMULATION_RESULT_CONTRACTS = ("mismatch_count_v1", "exit_code_v1")
 _TOP_MODULE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:")
 _TOP_LEVEL_FIELDS = {
@@ -20,9 +21,11 @@ _TOP_LEVEL_FIELDS = {
     "source_id",
     "attempt",
     "top_module",
+    "testbench_top",
     "candidate_rtl_path",
     "testbench_path",
     "support_files",
+    "simulation_result_contract",
     "requested_checks",
 }
 
@@ -43,9 +46,11 @@ class CandidateRow:
     source_id: str
     attempt: int
     top_module: str
+    testbench_top: str
     candidate_rtl_path: str
     testbench_path: str
     support_files: tuple[str, ...]
+    simulation_result_contract: str
     requested_checks: dict[str, bool]
     resolved_paths: dict[str, Path]
     resolved_support_paths: dict[str, Path]
@@ -140,6 +145,13 @@ def _validate_row(value: Any, line_number: int, root: Path) -> CandidateRow:
         raise CandidateManifestValidationError(
             f"{prefix}: invalid top_module {top_module!r}"
         )
+    testbench_top = _string(
+        value["testbench_top"], "testbench_top", prefix, nonempty=True
+    )
+    if not _TOP_MODULE_RE.fullmatch(testbench_top):
+        raise CandidateManifestValidationError(
+            f"{prefix}: invalid testbench_top {testbench_top!r}"
+        )
 
     candidate_rtl_path = _string(
         value["candidate_rtl_path"], "candidate_rtl_path", prefix, nonempty=True
@@ -166,6 +178,18 @@ def _validate_row(value: Any, line_number: int, root: Path) -> CandidateRow:
     if len(set(role_paths)) != len(role_paths):
         raise CandidateManifestValidationError(
             f"{prefix}: artifact paths must be unique across roles"
+        )
+
+    simulation_result_contract = _string(
+        value["simulation_result_contract"],
+        "simulation_result_contract",
+        prefix,
+        nonempty=True,
+    )
+    if simulation_result_contract not in SIMULATION_RESULT_CONTRACTS:
+        raise CandidateManifestValidationError(
+            f"{prefix}: unsupported simulation_result_contract "
+            f"{simulation_result_contract!r}"
         )
 
     checks_value = value["requested_checks"]
@@ -213,6 +237,21 @@ def _validate_row(value: Any, line_number: int, root: Path) -> CandidateRow:
         if support_file not in resolved_paths:
             resolved_paths[support_file] = resolved_support_paths[support_file]
 
+    artifact_entries = [
+        ("candidate_rtl_path", resolved_paths["candidate_rtl_path"]),
+        ("testbench_path", resolved_paths["testbench_path"]),
+    ]
+    artifact_entries.extend(
+        (f"support_files[{index}]", resolved_support_paths[path])
+        for index, path in enumerate(support_files)
+    )
+    for index, (left_label, left_path) in enumerate(artifact_entries):
+        for right_label, right_path in artifact_entries[index + 1 :]:
+            if _paths_alias(left_path, right_path):
+                raise CandidateManifestValidationError(
+                    f"{prefix}: artifact paths alias: {left_label} and {right_label}"
+                )
+
     return CandidateRow(
         schema_version=MANIFEST_SCHEMA_VERSION,
         candidate_id=candidate_id,
@@ -220,9 +259,11 @@ def _validate_row(value: Any, line_number: int, root: Path) -> CandidateRow:
         source_id=source_id,
         attempt=attempt,
         top_module=top_module,
+        testbench_top=testbench_top,
         candidate_rtl_path=candidate_rtl_path,
         testbench_path=testbench_path,
         support_files=support_files,
+        simulation_result_contract=simulation_result_contract,
         requested_checks=requested_checks,
         resolved_paths=resolved_paths,
         resolved_support_paths=resolved_support_paths,
@@ -325,3 +366,22 @@ def _positive_int(value: Any, field_name: str, prefix: str) -> int:
             f"{prefix}: {field_name} must be an integer greater than or equal to 1"
         )
     return value
+
+
+def _paths_alias(left: Path, right: Path) -> bool:
+    if left == right:
+        return True
+    try:
+        if left.samefile(right):
+            return True
+    except OSError:
+        pass
+    try:
+        left_stat = left.stat()
+        right_stat = right.stat()
+    except OSError:
+        return False
+    return (
+        getattr(left_stat, "st_dev", None) == getattr(right_stat, "st_dev", None)
+        and getattr(left_stat, "st_ino", None) == getattr(right_stat, "st_ino", None)
+    )

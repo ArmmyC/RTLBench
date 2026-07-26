@@ -36,7 +36,35 @@ def test_verify_candidates_parser():
     )
     assert args.manifest == Path("m.jsonl")
     assert args.timeout == 30.0
+    assert args.max_output_bytes == 65_536
     assert args.force is True
+
+
+def test_verify_candidates_parser_accepts_output_limit():
+    args = build_verify_candidates_parser().parse_args(
+        [
+            "--manifest", "m.jsonl",
+            "--output", "e.jsonl",
+            "--workspace-root", "corpus",
+            "--work-dir", "work",
+            "--max-output-bytes", "1024",
+        ]
+    )
+    assert args.max_output_bytes == 1024
+
+
+def test_verify_candidates_rejects_invalid_output_limit(tmp_path: Path):
+    fixture = Path(__file__).parent / "fixtures" / "candidate_verification"
+    assert cli.main(
+        [
+            "verify-candidates",
+            "--manifest", str(fixture / "manifest.jsonl"),
+            "--output", str(tmp_path / "evidence.jsonl"),
+            "--workspace-root", str(fixture),
+            "--work-dir", str(tmp_path / "work"),
+            "--max-output-bytes", "0",
+        ]
+    ) == 2
 
 
 def test_verify_candidates_help():
