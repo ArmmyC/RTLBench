@@ -4,7 +4,7 @@ A lightweight benchmark harness for evaluating LLM-generated RTL with simulation
 
 RTLBench helps you ask a simple question with real engineering gates behind it: _did the model generate usable RTL, and what did it cost under a public, reproducible flow?_
 
-[Quick start](#quick-start) - [RFID-APBench](#rfid-apbench) - [Scoring](#scoring) - [Docs](#useful-docs)
+[Quick start](#quick-start) - [Candidate verification](#candidate-verification) - [RFID-APBench](#rfid-apbench) - [Scoring](#scoring) - [Docs](#useful-docs)
 
 > [!IMPORTANT]
 > RTLBench is an evaluation repository, not a fine-tuning repository. It does not contain private RTL, training datasets, adapters, model weights, or raw model outputs.
@@ -94,6 +94,26 @@ flowchart LR
 Rows that fail extraction, compile, simulation, synthesis, or metric availability are reported with failure categories and excluded from valid-score means.
 
 ## Quick Start
+
+### Candidate verification
+
+Verify one generated candidate per manifest row against a private testbench:
+
+```bash
+rtlbench verify-candidates \
+  --manifest tests/fixtures/candidate_verification/manifest.jsonl \
+  --output /tmp/rtlbench-candidate-evidence.jsonl \
+  --workspace-root tests/fixtures/candidate_verification \
+  --work-dir /tmp/rtlbench-candidate-work \
+  --force
+```
+
+This command never calls a model and does not need reference RTL. Compile plus
+functional simulation determine acceptance; optional lint and synthesis are
+separate evidence. Private testbenches remain filesystem inputs and are not
+copied into evidence. Generated RTL and raw tool artifacts must not be
+committed. See `docs/specs/candidate_verification_v0.1.md` for the complete
+contract.
 
 ### Verify mutation artifacts
 

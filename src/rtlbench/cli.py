@@ -9,6 +9,16 @@ from rtlbench.mutation_verification import (
     VerificationPreflightError,
     verify_mutations,
 )
+from rtlbench.candidate_manifest import (
+    CandidateManifestValidationError,
+    CandidateWorkspaceValidationError,
+)
+from rtlbench.candidate_verification import (
+    CandidateVerificationInternalError,
+    CandidateVerificationInterrupted,
+    CandidateVerificationPreflightError,
+    verify_candidates,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -52,6 +62,20 @@ def build_verify_mutations_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_verify_candidates_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="rtlbench verify-candidates",
+        description="Verify generated RTL candidates from a JSONL manifest",
+    )
+    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--workspace-root", type=Path, required=True)
+    parser.add_argument("--work-dir", type=Path, required=True)
+    parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--force", action="store_true")
+    return parser
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments and arguments[0] == "verify-mutations":
@@ -74,6 +98,35 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 2
+        print(f"Wrote {summary['rows']} evidence row(s) to {args.output}")
+        return 0
+
+    if arguments and arguments[0] == "verify-candidates":
+        args = build_verify_candidates_parser().parse_args(arguments[1:])
+        if args.timeout <= 0:
+            print("timeout must be greater than zero", file=sys.stderr)
+            return 2
+        try:
+            summary = verify_candidates(
+                manifest=args.manifest,
+                output=args.output,
+                workspace_root=args.workspace_root,
+                work_dir=args.work_dir,
+                timeout=args.timeout,
+                force=args.force,
+            )
+        except CandidateVerificationInterrupted as exc:
+            print(str(exc), file=sys.stderr)
+            return 4
+        except CandidateVerificationInternalError as exc:
+            print(str(exc), file=sys.stderr)
+            return 4
+        except CandidateVerificationPreflightError as exc:
+            print(str(exc), file=sys.stderr)
+            return 3
+        except (CandidateManifestValidationError, CandidateWorkspaceValidationError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 3 if isinstance(exc, CandidateWorkspaceValidationError) else 2
         print(f"Wrote {summary['rows']} evidence row(s) to {args.output}")
         return 0
 
