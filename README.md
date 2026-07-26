@@ -115,6 +115,10 @@ copied into evidence. Generated RTL and raw tool artifacts must not be
 committed. See `docs/specs/candidate_verification_v0.1.md` for the complete
 contract.
 
+Candidate inputs are copied into bounded managed snapshots before any tool
+runs. Defaults are 8 MiB per artifact, 32 MiB per row, and 256 MiB per run;
+these are preflight limits, not a substitute for external isolation.
+
 #### Candidate execution security
 
 Generated RTL is executable simulator input. Path validation and diagnostic

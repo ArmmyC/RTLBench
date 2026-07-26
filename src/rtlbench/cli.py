@@ -14,8 +14,14 @@ from rtlbench.candidate_manifest import (
     CandidateWorkspaceValidationError,
 )
 from rtlbench.candidate_verification import (
+    DEFAULT_MAX_ARTIFACT_BYTES,
     DEFAULT_MAX_OUTPUT_BYTES,
+    DEFAULT_MAX_ROW_INPUT_BYTES,
+    DEFAULT_MAX_RUN_INPUT_BYTES,
+    MAX_ARTIFACT_BYTES_LIMIT,
     MAX_OUTPUT_BYTES_LIMIT,
+    MAX_ROW_INPUT_BYTES_LIMIT,
+    MAX_RUN_INPUT_BYTES_LIMIT,
     CandidateVerificationInternalError,
     CandidateVerificationInterrupted,
     CandidateVerificationPreflightError,
@@ -75,6 +81,15 @@ def build_verify_candidates_parser() -> argparse.ArgumentParser:
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--max-output-bytes", type=int, default=DEFAULT_MAX_OUTPUT_BYTES)
+    parser.add_argument(
+        "--max-artifact-bytes", type=int, default=DEFAULT_MAX_ARTIFACT_BYTES
+    )
+    parser.add_argument(
+        "--max-row-input-bytes", type=int, default=DEFAULT_MAX_ROW_INPUT_BYTES
+    )
+    parser.add_argument(
+        "--max-run-input-bytes", type=int, default=DEFAULT_MAX_RUN_INPUT_BYTES
+    )
     parser.add_argument("--force", action="store_true")
     return parser
 
@@ -115,6 +130,18 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
+        input_limits = (
+            ("max-artifact-bytes", args.max_artifact_bytes, MAX_ARTIFACT_BYTES_LIMIT),
+            ("max-row-input-bytes", args.max_row_input_bytes, MAX_ROW_INPUT_BYTES_LIMIT),
+            ("max-run-input-bytes", args.max_run_input_bytes, MAX_RUN_INPUT_BYTES_LIMIT),
+        )
+        for name, value, hard_cap in input_limits:
+            if value <= 0 or value > hard_cap:
+                print(
+                    f"{name} must be between 1 and {hard_cap}",
+                    file=sys.stderr,
+                )
+                return 2
         try:
             summary = verify_candidates(
                 manifest=args.manifest,
@@ -124,6 +151,9 @@ def main(argv: list[str] | None = None) -> int:
                 timeout=args.timeout,
                 force=args.force,
                 max_output_bytes=args.max_output_bytes,
+                max_artifact_bytes=args.max_artifact_bytes,
+                max_row_input_bytes=args.max_row_input_bytes,
+                max_run_input_bytes=args.max_run_input_bytes,
             )
         except CandidateVerificationInterrupted as exc:
             print(str(exc), file=sys.stderr)

@@ -26,6 +26,7 @@ rtlbench verify-candidates \
   --workspace-root workspace \
   --work-dir /tmp/rtlbench-candidates \
   --timeout 30 \
+  --max-artifact-bytes 8388608 \
   --force
 ```
 
@@ -90,9 +91,11 @@ are `schema_version`, `candidate_id`, `task_id`, `source_id`, `attempt`,
 `requested_checks`, `input_hashes`, `toolchain`, `checks`, `mismatch_summary`,
 `failure_category`, `accepted`, and `diagnostics`.
 
-SHA-256 hashes are calculated from bytes during preflight before tools run.
-Support hashes are sorted by manifest path. Tool availability and versions are
-discovered once per run; an executable whose version probe fails remains
+SHA-256 hashes are calculated while streaming each validated workspace input
+into a newly created managed snapshot, before tools run. The verifier executes
+only those snapshots; the original workspace paths are never passed to a
+tool. Support hashes retain their logical manifest paths and are sorted by
+manifest path. Tool availability and versions are discovered once per run; an executable whose version probe fails remains
 `available: true` with `version: null`, while a missing executable is explicit
 `available: false` with `version: null`.
 
@@ -117,6 +120,34 @@ Evidence uses stable sorted-key JSON, newline termination, manifest order, and
 no timestamps or durations. It contains no RTL, testbench/support contents,
 raw subprocess output, environment dumps, secrets, reference RTL, or private
 absolute paths.
+
+## Input snapshots and size limits
+
+After complete manifest and filesystem validation, every row is copied into an
+unpredictable managed run directory before tool discovery or execution. A row
+uses a layout like:
+
+```text
+<managed-run>/inputs/000001_<candidate-digest>/
+  candidate.sv
+  testbench.sv
+  support/0000_<safe-name>
+```
+
+Copying is bounded, chunked, hash-coupled, and performed without following a
+final source symlink. Snapshots are flushed, closed, and read-only where the
+platform permits. Hashes and executed bytes therefore describe the same
+prepared inputs. Changes or deletion of original workspace files after
+preparation cannot change verification. Snapshots are scratch artifacts and
+are never evidence outputs.
+
+The defaults are 8 MiB per artifact, 32 MiB per row, and 256 MiB for the full
+run. The hard caps are 32 MiB per artifact, 128 MiB per row, and 512 MiB per
+run. `--max-artifact-bytes`, `--max-row-input-bytes`, and
+`--max-run-input-bytes` may lower these limits, subject to the hard caps.
+Limits are enforced during streaming, including for files that grow while
+being read. Any limit failure is a batch preflight failure; no tool is run and
+no final evidence is published.
 
 ## Compile and simulation
 
@@ -231,6 +262,14 @@ secrets are redacted. Source lines and artifact contents are removed. A
 successful testbench's output is not included merely because it printed
 `Mismatches: 0`.
 
+Redaction indexes are built once from bounded snapshots. At most 20,000 source
+lines, 1,024 bytes per indexed line, and 10,000 long tokens are indexed. If an
+indexing limit is reached, verification continues with a conservative policy
+that omits raw tool text. Simulation diagnostics prefer structured stage,
+return-code, timeout, output-limit, and evidence fields; compile, lint, and
+synthesis retain bounded sanitized error summaries. Source-context and caret
+lines are removed.
+
 Each tool invocation has a 65,536-byte combined stdout/stderr limit by
 default. The child is terminated when the limit is exceeded and only bounded
 sanitized text is retained; the diagnostic states `output_limit_exceeded`.
@@ -238,12 +277,16 @@ sanitized text is retained; the diagnostic states `output_limit_exceeded`.
 4 MiB cap. Tool subprocesses receive a minimal deterministic environment with
 scratch-directed temporary and home directories. Parent API keys, tokens,
 passwords, cloud credentials, and private application variables are not
-forwarded. This environment reduction is defense-in-depth, not a sandbox.
+forwarded. `PATH` contains only safe absolute caller entries, platform
+defaults, and directories containing discovered executables, so required
+helper tools remain usable without inheriting arbitrary environment values.
+This environment reduction is defense-in-depth, not a sandbox.
 
 ## Execution security
 
-Generated RTL is executable simulator input. Path validation, bounded process
-output, and diagnostic sanitization are not an operating-system sandbox.
+Generated RTL is executable simulator input. Path validation, immutable input
+snapshots, bounded process output, diagnostic sanitization, and process-tree
+cleanup are not an operating-system sandbox.
 Teacher-generated candidates must be evaluated inside a disposable,
 least-privileged container or VM with no network access. The workspace should
 be read-only except for managed scratch, no production secrets should be
@@ -264,6 +307,12 @@ completed row, and atomically replaces the final output with `os.replace` on
 normal completion. Existing final/partial outputs require `--force`; force may
 replace only those exact managed paths. Output and partial symlinks, directories,
 hard-link aliases, input aliases, and output/partial collisions are rejected.
+The work directory may not alias a regular input, and output paths may not
+alias managed snapshots. Snapshot destinations are newly created and are not
+reused across runs. On POSIX, each tool runs in a new process session;
+timeout, interruption, and output overflow terminate the process group with a
+bounded TERM-then-KILL sequence. Windows uses a new process group and best-
+effort CTRL-BREAK/kill cleanup; descendant cleanup has platform limitations.
 An interruption retains the managed partial and leaves an existing final output
 untouched. Candidate-level exceptions become bounded `internal_error` rows and
 later rows continue. Batch-level preflight/publication errors do not create a

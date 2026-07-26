@@ -37,6 +37,9 @@ def test_verify_candidates_parser():
     assert args.manifest == Path("m.jsonl")
     assert args.timeout == 30.0
     assert args.max_output_bytes == 65_536
+    assert args.max_artifact_bytes == 8 * 1024 * 1024
+    assert args.max_row_input_bytes == 32 * 1024 * 1024
+    assert args.max_run_input_bytes == 256 * 1024 * 1024
     assert args.force is True
 
 
@@ -53,6 +56,21 @@ def test_verify_candidates_parser_accepts_output_limit():
     assert args.max_output_bytes == 1024
 
 
+def test_verify_candidates_parser_accepts_input_limits():
+    args = build_verify_candidates_parser().parse_args(
+        [
+            "--manifest", "m.jsonl",
+            "--output", "e.jsonl",
+            "--workspace-root", "corpus",
+            "--work-dir", "work",
+            "--max-artifact-bytes", "100",
+            "--max-row-input-bytes", "200",
+            "--max-run-input-bytes", "300",
+        ]
+    )
+    assert (args.max_artifact_bytes, args.max_row_input_bytes, args.max_run_input_bytes) == (100, 200, 300)
+
+
 def test_verify_candidates_rejects_invalid_output_limit(tmp_path: Path):
     fixture = Path(__file__).parent / "fixtures" / "candidate_verification"
     assert cli.main(
@@ -63,6 +81,31 @@ def test_verify_candidates_rejects_invalid_output_limit(tmp_path: Path):
             "--workspace-root", str(fixture),
             "--work-dir", str(tmp_path / "work"),
             "--max-output-bytes", "0",
+        ]
+    ) == 2
+
+
+@pytest.mark.parametrize(
+    "option,value",
+    [
+        ("--max-artifact-bytes", "0"),
+        ("--max-row-input-bytes", "0"),
+        ("--max-run-input-bytes", "0"),
+        ("--max-artifact-bytes", str(32 * 1024 * 1024 + 1)),
+    ],
+)
+def test_verify_candidates_rejects_invalid_input_limits(
+    tmp_path: Path, option: str, value: str
+):
+    fixture = Path(__file__).parent / "fixtures" / "candidate_verification"
+    assert cli.main(
+        [
+            "verify-candidates",
+            "--manifest", str(fixture / "manifest.jsonl"),
+            "--output", str(tmp_path / f"{option[2:]}.jsonl"),
+            "--workspace-root", str(fixture),
+            "--work-dir", str(tmp_path / "work"),
+            option, value,
         ]
     ) == 2
 

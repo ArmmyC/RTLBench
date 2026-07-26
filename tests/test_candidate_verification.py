@@ -3,6 +3,7 @@ import json
 import os
 import stat
 import textwrap
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -31,6 +32,14 @@ def _fake_tools(tmp_path: Path) -> dict[str, verification.ToolInfo]:
         if [ "${1:-}" = "-V" ]; then echo 'fake iverilog 1.0'; exit 0; fi
         if [ "${FAKE_IVERILOG_SLEEP:-0}" != "0" ]; then sleep "$FAKE_IVERILOG_SLEEP"; fi
         if [ "${FAKE_IVERILOG_FAIL:-0}" != "0" ]; then echo 'compile error'; exit 1; fi
+        if [ -n "${FAKE_RECORD_INPUT_DIR:-}" ]; then
+          mkdir -p "$FAKE_RECORD_INPUT_DIR"
+          for arg in "$@"; do
+            case "$arg" in
+              *.sv) name="${arg##*/}"; cat "$arg" > "$FAKE_RECORD_INPUT_DIR/$name" ;;
+            esac
+          done
+        fi
         if [ -n "${FAKE_IVERILOG_TRACE:-}" ]; then printf '%s\n' "$*" >> "$FAKE_IVERILOG_TRACE"; fi
         if [ "${FAKE_IVERILOG_FLOOD:-0}" != "0" ]; then
           i=0
@@ -128,6 +137,220 @@ def _direct_row_evidence(
         environment={key: str(value) for key, value in env.items()},
     )
     return evidence
+
+
+def _custom_snapshot_fixture(tmp_path: Path):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    files = {
+        "candidate.sv": "CANDIDATE_ORIGINAL_SENTINEL\n",
+        "testbench.sv": "TESTBENCH_ORIGINAL_SENTINEL\n",
+        "support.sv": "SUPPORT_ORIGINAL_SENTINEL\n",
+    }
+    for name, content in files.items():
+        (root / name).write_text(content, encoding="utf-8")
+    row = {
+        "schema_version": "rtl_candidate_manifest_v0.1",
+        "candidate_id": "snapshot-candidate",
+        "task_id": "snapshot-task",
+        "source_id": "snapshot-source",
+        "attempt": 1,
+        "top_module": "TopModule",
+        "testbench_top": "tb",
+        "candidate_rtl_path": "candidate.sv",
+        "testbench_path": "testbench.sv",
+        "support_files": ["support.sv"],
+        "simulation_result_contract": "mismatch_count_v1",
+        "requested_checks": {
+            "compile": True,
+            "simulation": True,
+            "lint": False,
+            "synthesis": False,
+        },
+    }
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    return manifest, root, files
+
+
+@pytest.mark.parametrize("action", ["modify", "delete"])
+def test_execution_uses_prepared_snapshot_bytes_after_workspace_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str
+):
+    manifest, root, files = _custom_snapshot_fixture(tmp_path)
+    record_dir = tmp_path / "recorded-inputs"
+    tools = _fake_tools(tmp_path / "tools")
+
+    def discover(**kwargs):
+        for name, original in files.items():
+            path = root / name
+            if action == "delete":
+                path.unlink()
+            else:
+                path.write_text(f"{name.upper()}_MODIFIED_SENTINEL\n", encoding="utf-8")
+        return tools
+
+    monkeypatch.setattr(verification, "discover_toolchain", discover)
+    output = tmp_path / "evidence.jsonl"
+    verification.verify_candidates(
+        manifest=manifest,
+        output=output,
+        workspace_root=root,
+        work_dir=tmp_path / "work",
+        force=True,
+        environment={
+            "FAKE_RECORD_INPUT_DIR": str(record_dir),
+            "FAKE_VVP_OUTPUT": "Mismatches: 0 in 1 samples",
+        },
+    )
+    evidence = json.loads(output.read_text(encoding="utf-8"))
+    assert evidence["accepted"] is True
+    assert evidence["input_hashes"]["candidate_rtl_sha256"] == hashlib.sha256(
+        files["candidate.sv"].encode()
+    ).hexdigest()
+    assert evidence["input_hashes"]["testbench_sha256"] == hashlib.sha256(
+        files["testbench.sv"].encode()
+    ).hexdigest()
+    assert evidence["input_hashes"]["support_files"][0]["sha256"] == hashlib.sha256(
+        files["support.sv"].encode()
+    ).hexdigest()
+    assert (record_dir / "candidate.sv").read_text(encoding="utf-8") == files[
+        "candidate.sv"
+    ]
+    assert (record_dir / "testbench.sv").read_text(encoding="utf-8") == files[
+        "testbench.sv"
+    ]
+    support_record = next(record_dir.glob("*support.sv"))
+    assert support_record.read_text(encoding="utf-8") == files["support.sv"]
+
+
+@pytest.mark.parametrize("artifact", ["candidate.sv", "testbench.sv", "support.sv"])
+def test_artifact_limit_rejects_each_input_before_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, artifact: str
+):
+    manifest, root, _ = _custom_snapshot_fixture(tmp_path)
+    (root / artifact).write_bytes(b"12345")
+    called = []
+    monkeypatch.setattr(verification, "discover_toolchain", lambda **kwargs: called.append(True))
+    output = tmp_path / "evidence.jsonl"
+    with pytest.raises(verification.CandidateVerificationPreflightError, match="max-artifact-bytes"):
+        verification.verify_candidates(
+            manifest=manifest,
+            output=output,
+            workspace_root=root,
+            work_dir=tmp_path / "work",
+            force=True,
+            max_artifact_bytes=4,
+            max_row_input_bytes=100,
+            max_run_input_bytes=100,
+        )
+    assert called == []
+    assert not output.exists()
+
+
+def test_row_and_run_limits_are_enforced_before_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    manifest, root, _ = _custom_snapshot_fixture(tmp_path)
+    called = []
+    monkeypatch.setattr(verification, "discover_toolchain", lambda **kwargs: called.append(True))
+    with pytest.raises(verification.CandidateVerificationPreflightError, match="max-row-input-bytes"):
+        verification.verify_candidates(
+            manifest=manifest,
+            output=tmp_path / "row-evidence.jsonl",
+            workspace_root=root,
+            work_dir=tmp_path / "row-work",
+            force=True,
+            max_artifact_bytes=100,
+            max_row_input_bytes=10,
+            max_run_input_bytes=100,
+        )
+    assert called == []
+
+    with pytest.raises(verification.CandidateVerificationPreflightError, match="max-run-input-bytes"):
+        verification.verify_candidates(
+            manifest=manifest,
+            output=tmp_path / "run-evidence.jsonl",
+            workspace_root=root,
+            work_dir=tmp_path / "run-work",
+            force=True,
+            max_artifact_bytes=100,
+            max_row_input_bytes=100,
+            max_run_input_bytes=10,
+        )
+    assert called == []
+
+
+def test_exact_artifact_boundary_is_accepted(tmp_path: Path):
+    manifest, root, _ = _custom_snapshot_fixture(tmp_path)
+    rows = load_manifest(manifest, root)
+    managed_run = tmp_path / "run"
+    managed_run.mkdir()
+    prepared = verification.prepare_candidate_rows(
+        rows,
+        managed_run,
+        max_artifact_bytes=len("CANDIDATE_ORIGINAL_SENTINEL\n"),
+        max_row_input_bytes=100,
+        max_run_input_bytes=100,
+    )
+    assert prepared[0].input_hashes["candidate_rtl_sha256"] == hashlib.sha256(
+        b"CANDIDATE_ORIGINAL_SENTINEL\n"
+    ).hexdigest()
+
+
+def test_input_limit_arguments_reject_booleans_and_hard_cap_overflow(tmp_path: Path):
+    manifest, root, _ = _custom_snapshot_fixture(tmp_path)
+    for value in (True, 0, verification.MAX_ARTIFACT_BYTES_LIMIT + 1):
+        with pytest.raises(verification.CandidateManifestValidationError):
+            verification.verify_candidates(
+                manifest=manifest,
+                output=tmp_path / f"evidence-{value}.jsonl",
+                workspace_root=root,
+                work_dir=tmp_path / f"work-{value}",
+                max_artifact_bytes=value,
+            )
+
+
+def test_file_growing_during_copy_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    manifest, root, _ = _custom_snapshot_fixture(tmp_path)
+    original_fstat = verification.os.fstat
+    calls = {"count": 0}
+
+    def fstat_with_growth(descriptor):
+        calls["count"] += 1
+        if calls["count"] == 3:
+            (root / "candidate.sv").write_bytes(b"CANDIDATE_ORIGINAL_SENTINEL\nGROWN")
+        return original_fstat(descriptor)
+
+    monkeypatch.setattr(verification.os, "fstat", fstat_with_growth)
+    rows = load_manifest(manifest, root)
+    managed_run = tmp_path / "run"
+    managed_run.mkdir()
+    with pytest.raises(verification.CandidateVerificationPreflightError, match="source changed"):
+        verification.prepare_candidate_rows(rows, managed_run)
+
+
+def test_diagnostic_index_limit_omits_unproven_raw_tool_text(tmp_path: Path):
+    manifest, root, _ = _custom_snapshot_fixture(tmp_path)
+    long_sentinel = "LONG-SOURCE-SENTINEL-WITHOUT_VALID_IDENTIFIER_CHARS"
+    (root / "candidate.sv").write_text(
+        "module TopModule; // " + ("x" * 1100) + long_sentinel + "\nendmodule\n",
+        encoding="utf-8",
+    )
+    row = load_manifest(manifest, root)[0]
+    managed_run = tmp_path / "run"
+    managed_run.mkdir()
+    prepared = verification.prepare_candidate_rows([row], managed_run)[0]
+    context = verification._build_redaction_context(row, prepared)
+    diagnostic = verification._diagnostic(
+        "compile",
+        verification.CommandResult(1, long_sentinel + " compiler context"),
+        root,
+        managed_run,
+        manifest,
+        context,
+    )
+    assert diagnostic is not None
+    assert long_sentinel not in diagnostic
+    assert "returncode=1" in diagnostic
 
 
 def test_accepted_compile_and_simulation_pass(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -343,7 +566,59 @@ def test_parent_environment_is_not_forwarded_to_tools(
     )
     serialized = json.dumps(evidence, sort_keys=True)
     assert "PRIVATE_SECRET_SENTINEL" not in serialized
-    assert "not-visible" in " ".join(evidence["diagnostics"])
+    assert evidence["diagnostics"] == ["simulation: returncode=0"]
+
+
+def test_minimal_path_retains_discovered_tool_directory_without_parent_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    tool_dir = tmp_path / "absolute-tool-dir"
+    helper = _make_tool(tool_dir / "fake-helper", "echo helper-visible\n")
+    tool = _make_tool(
+        tool_dir / "fake-tool",
+        """
+        helper_output=$(fake-helper)
+        printf 'helper=%s secret=%s\\n' "$helper_output" "${PARENT_SECRET_SENTINEL:-not-visible}"
+        exit 0
+        """,
+    )
+    monkeypatch.setenv("PARENT_SECRET_SENTINEL", "PRIVATE_PARENT_SECRET")
+    result = verification._run([str(tool)], tmp_path, 0.5)
+    assert result.returncode == 0
+    assert "helper=helper-visible" in result.output
+    assert "PRIVATE_PARENT_SECRET" not in result.output
+    assert helper.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group test requires POSIX")
+@pytest.mark.parametrize("mode", ["timeout", "output"])
+def test_process_group_cleanup_kills_descendants(
+    tmp_path: Path, mode: str
+):
+    marker = tmp_path / f"descendant-{mode}.marker"
+    tool = _make_tool(
+        tmp_path / f"tree-tool-{mode}",
+        """
+        (sleep 0.3; : > "$FAKE_DESCENDANT_MARKER") &
+        if [ "$FAKE_TREE_MODE" = "output" ]; then
+          i=0
+          while [ "$i" -lt 100000 ]; do printf 'tree-flood'; i=$((i + 1)); done
+        else
+          sleep 5
+        fi
+        """,
+    )
+    result = verification._run(
+        [str(tool)],
+        tmp_path,
+        0.05 if mode == "timeout" else 1.0,
+        128 if mode == "output" else verification.DEFAULT_MAX_OUTPUT_BYTES,
+        {"FAKE_DESCENDANT_MARKER": str(marker), "FAKE_TREE_MODE": mode},
+    )
+    assert result.timed_out is (mode == "timeout")
+    assert result.output_limit_exceeded is (mode == "output")
+    time.sleep(0.5)
+    assert not marker.exists()
 
 
 @pytest.mark.parametrize("output", ["Mismatches: 0", "Mismatches: 0 in 20 samples"])
@@ -691,6 +966,55 @@ def test_output_cannot_alias_manifest_or_artifact(
             workspace_root=FIXTURE,
             work_dir=tmp_path / "work",
             force=True,
+        )
+
+
+def test_work_dir_cannot_alias_regular_input(tmp_path: Path):
+    fixture = FIXTURE / "passing"
+    with pytest.raises(verification.CandidateVerificationPreflightError, match="work-dir"):
+        verification.verify_candidates(
+            manifest=FIXTURE / "manifest.jsonl",
+            output=tmp_path / "evidence.jsonl",
+            workspace_root=FIXTURE,
+            work_dir=fixture / "candidate.sv",
+            force=True,
+        )
+
+
+def test_preexisting_predictable_snapshot_path_is_not_reused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    manifest, root, _ = _custom_snapshot_fixture(tmp_path)
+    work_dir = tmp_path / "work"
+    predictable = work_dir / "inputs" / "000001_predictable"
+    predictable.mkdir(parents=True)
+    marker = predictable / "marker"
+    marker.write_text("caller-owned", encoding="utf-8")
+    tools = _fake_tools(tmp_path / "tools")
+    monkeypatch.setattr(verification, "discover_toolchain", lambda **kwargs: tools)
+    output = tmp_path / "evidence.jsonl"
+    verification.verify_candidates(
+        manifest=manifest,
+        output=output,
+        workspace_root=root,
+        work_dir=work_dir,
+        force=True,
+        environment={"FAKE_VVP_OUTPUT": "Mismatches: 0 in 1 samples"},
+    )
+    assert marker.read_text(encoding="utf-8") == "caller-owned"
+
+
+def test_output_cannot_alias_prepared_snapshot(tmp_path: Path):
+    manifest, root, _ = _custom_snapshot_fixture(tmp_path)
+    row = load_manifest(manifest, root)[0]
+    managed_run = tmp_path / "run"
+    managed_run.mkdir()
+    prepared = verification.prepare_candidate_rows([row], managed_run)[0]
+    with pytest.raises(verification.CandidateVerificationPreflightError, match="snapshot"):
+        verification._reject_output_snapshot_collisions(
+            prepared.candidate_snapshot,
+            Path(str(prepared.candidate_snapshot) + ".rtlbench-partial"),
+            [prepared],
         )
 
 

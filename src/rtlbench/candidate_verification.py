@@ -7,7 +7,9 @@ import json
 import os
 import queue
 import re
+import signal
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -34,6 +36,19 @@ TOOL_VERSION_ARGS = {
 _TOOL_NAMES = ("iverilog", "vvp", "verilator", "yosys")
 DEFAULT_MAX_OUTPUT_BYTES = 65_536
 MAX_OUTPUT_BYTES_LIMIT = 4 * 1024 * 1024
+DEFAULT_MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
+DEFAULT_MAX_ROW_INPUT_BYTES = 32 * 1024 * 1024
+DEFAULT_MAX_RUN_INPUT_BYTES = 256 * 1024 * 1024
+MAX_ARTIFACT_BYTES_LIMIT = 32 * 1024 * 1024
+MAX_ROW_INPUT_BYTES_LIMIT = 128 * 1024 * 1024
+MAX_RUN_INPUT_BYTES_LIMIT = 512 * 1024 * 1024
+_COPY_CHUNK_BYTES = 64 * 1024
+_MAX_DIAGNOSTIC_INDEX_LINES = 20_000
+_MAX_DIAGNOSTIC_INDEX_LINE_BYTES = 1_024
+_MAX_DIAGNOSTIC_INDEX_TOKENS = 10_000
+_MAX_DIAGNOSTIC_FALLBACK_BYTES = DEFAULT_MAX_ARTIFACT_BYTES
+_PROCESS_GROUP_GRACE_SECONDS = 0.2
+_READER_JOIN_SECONDS = 1.0
 _MISMATCH_LONG_RE = re.compile(
     r"(?im)^[ \t]*mismatches[ \t]*:[ \t]*([0-9]+)[ \t]+in[ \t]+([0-9]+)[ \t]+samples[ \t]*\r?$"
 )
@@ -75,6 +90,25 @@ class CommandResult:
 
 
 @dataclass(frozen=True)
+class PreparedCandidateRow:
+    """A manifest row whose inputs are immutable managed snapshots."""
+
+    manifest_row: CandidateRow
+    candidate_snapshot: Path
+    testbench_snapshot: Path
+    support_snapshots: dict[str, Path]
+    input_hashes: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class DiagnosticRedactionContext:
+    path_strings: tuple[str, ...]
+    source_lines: frozenset[str]
+    long_tokens: frozenset[str]
+    conservative: bool = False
+
+
+@dataclass(frozen=True)
 class MismatchReport:
     contract: str
     reported_counts: tuple[int, ...]
@@ -108,6 +142,8 @@ def discover_toolchain(
     result: dict[str, ToolInfo] = {}
     for name in _TOOL_NAMES:
         path = resolver(name)
+        if path and not os.path.isabs(path):
+            path = str(Path(path).resolve())
         version = (
             _capture_version(
                 path,
@@ -155,6 +191,248 @@ def hash_inputs(row: CandidateRow) -> dict[str, Any]:
     }
 
 
+def prepare_candidate_rows(
+    rows: list[CandidateRow],
+    managed_run: Path,
+    *,
+    max_artifact_bytes: int = DEFAULT_MAX_ARTIFACT_BYTES,
+    max_row_input_bytes: int = DEFAULT_MAX_ROW_INPUT_BYTES,
+    max_run_input_bytes: int = DEFAULT_MAX_RUN_INPUT_BYTES,
+) -> list[PreparedCandidateRow]:
+    """Snapshot every validated row before any tool discovery or execution."""
+
+    _validate_input_limits(
+        max_artifact_bytes, max_row_input_bytes, max_run_input_bytes
+    )
+    snapshot_root = managed_run / "inputs"
+    if _contains_symlink(snapshot_root):
+        raise CandidateVerificationPreflightError(
+            "managed snapshot root must not contain symlinked path components"
+        )
+    try:
+        snapshot_root.mkdir(parents=True, exist_ok=False)
+    except FileExistsError as exc:
+        raise CandidateVerificationPreflightError(
+            "managed snapshot root already exists"
+        ) from exc
+    except OSError as exc:
+        raise CandidateVerificationPreflightError(
+            f"could not create managed snapshot root: {exc}"
+        ) from exc
+
+    budget = [0]
+    prepared: list[PreparedCandidateRow] = []
+    for row_index, row in enumerate(rows, 1):
+        prepared.append(
+            _prepare_candidate_row(
+                row,
+                snapshot_root,
+                row_index,
+                budget,
+                max_artifact_bytes,
+                max_row_input_bytes,
+                max_run_input_bytes,
+            )
+        )
+    return prepared
+
+
+def _prepare_candidate_row(
+    row: CandidateRow,
+    snapshot_root: Path,
+    row_index: int,
+    run_budget: list[int],
+    max_artifact_bytes: int,
+    max_row_input_bytes: int,
+    max_run_input_bytes: int,
+) -> PreparedCandidateRow:
+    row_dir = snapshot_root / (
+        f"{row_index:06d}_{hashlib.sha256(row.candidate_id.encode()).hexdigest()[:12]}"
+    )
+    support_dir = row_dir / "support"
+    try:
+        row_dir.mkdir(mode=0o700)
+        support_dir.mkdir(mode=0o700)
+    except OSError as exc:
+        raise CandidateVerificationPreflightError(
+            f"could not create managed snapshot directory: {exc}"
+        ) from exc
+
+    row_bytes = [0]
+    candidate_snapshot = row_dir / "candidate.sv"
+    candidate_hash = _copy_snapshot(
+        row.resolved_paths["candidate_rtl_path"],
+        candidate_snapshot,
+        row_bytes,
+        run_budget,
+        max_artifact_bytes,
+        max_row_input_bytes,
+        max_run_input_bytes,
+    )
+    testbench_snapshot = row_dir / "testbench.sv"
+    testbench_hash = _copy_snapshot(
+        row.resolved_paths["testbench_path"],
+        testbench_snapshot,
+        row_bytes,
+        run_budget,
+        max_artifact_bytes,
+        max_row_input_bytes,
+        max_run_input_bytes,
+    )
+    support_snapshots: dict[str, Path] = {}
+    support_hashes: list[dict[str, str]] = []
+    for support_index, logical_path in enumerate(sorted(row.support_files)):
+        snapshot = support_dir / (
+            f"{support_index:04d}_{_safe_name(Path(logical_path).name)}"
+        )
+        support_snapshots[logical_path] = snapshot
+        support_hashes.append(
+            {
+                "path": logical_path,
+                "sha256": _copy_snapshot(
+                    row.resolved_support_paths[logical_path],
+                    snapshot,
+                    row_bytes,
+                    run_budget,
+                    max_artifact_bytes,
+                    max_row_input_bytes,
+                    max_run_input_bytes,
+                ),
+            }
+        )
+    return PreparedCandidateRow(
+        manifest_row=row,
+        candidate_snapshot=candidate_snapshot,
+        testbench_snapshot=testbench_snapshot,
+        support_snapshots=support_snapshots,
+        input_hashes={
+            "candidate_rtl_sha256": candidate_hash,
+            "testbench_sha256": testbench_hash,
+            "support_files": support_hashes,
+        },
+    )
+
+
+def _copy_snapshot(
+    source: Path,
+    destination: Path,
+    row_bytes: list[int],
+    run_budget: list[int],
+    max_artifact_bytes: int,
+    max_row_input_bytes: int,
+    max_run_input_bytes: int,
+) -> str:
+    digest = hashlib.sha256()
+    copied = 0
+    source_fd = _open_regular_source(source)
+    destination_fd: int | None = None
+    source_handle = None
+    destination_handle = None
+    try:
+        destination_fd = os.open(
+            destination,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
+        source_handle = os.fdopen(source_fd, "rb", closefd=True)
+        source_fd = -1
+        destination_handle = os.fdopen(destination_fd, "wb", closefd=True)
+        destination_fd = None
+        initial_size = os.fstat(source_handle.fileno()).st_size
+        while True:
+            chunk = source_handle.read(_COPY_CHUNK_BYTES)
+            if not chunk:
+                break
+            next_size = copied + len(chunk)
+            if next_size > max_artifact_bytes:
+                raise CandidateVerificationPreflightError(
+                    f"artifact exceeds max-artifact-bytes: {source}"
+                )
+            if row_bytes[0] + len(chunk) > max_row_input_bytes:
+                raise CandidateVerificationPreflightError(
+                    f"row inputs exceed max-row-input-bytes: {source}"
+                )
+            if run_budget[0] + len(chunk) > max_run_input_bytes:
+                raise CandidateVerificationPreflightError(
+                    f"run inputs exceed max-run-input-bytes: {source}"
+                )
+            digest.update(chunk)
+            written = destination_handle.write(chunk)
+            if written != len(chunk):
+                raise CandidateVerificationPreflightError(
+                    f"short snapshot write: {source}"
+                )
+            copied = next_size
+            row_bytes[0] += len(chunk)
+            run_budget[0] += len(chunk)
+        final_size = os.fstat(source_handle.fileno()).st_size
+        if copied < final_size or copied < initial_size:
+            raise CandidateVerificationPreflightError(
+                f"source changed during snapshot: {source}"
+            )
+        destination_handle.flush()
+        os.fsync(destination_handle.fileno())
+        os.chmod(destination, stat.S_IRUSR)
+    except OSError as exc:
+        raise CandidateVerificationPreflightError(
+            f"could not snapshot input {source}: {exc}"
+        ) from exc
+    finally:
+        if source_handle is not None:
+            source_handle.close()
+        if destination_handle is not None:
+            destination_handle.close()
+        if source_fd >= 0:
+            os.close(source_fd)
+        if destination_fd is not None:
+            os.close(destination_fd)
+    return digest.hexdigest()
+
+
+def _open_regular_source(path: Path) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow and path.is_symlink():
+        raise CandidateVerificationPreflightError(
+            f"snapshot source must not be a symlink: {path}"
+        )
+    try:
+        descriptor = os.open(path, flags | nofollow)
+        mode = os.fstat(descriptor).st_mode
+        if not stat.S_ISREG(mode):
+            os.close(descriptor)
+            raise CandidateVerificationPreflightError(
+                f"snapshot source is not a regular file: {path}"
+            )
+        return descriptor
+    except CandidateVerificationPreflightError:
+        raise
+    except OSError as exc:
+        raise CandidateVerificationPreflightError(
+            f"could not open snapshot source {path}: {exc}"
+        ) from exc
+
+
+def _validate_input_limits(
+    max_artifact_bytes: int,
+    max_row_input_bytes: int,
+    max_run_input_bytes: int,
+) -> None:
+    values = (
+        ("max-artifact-bytes", max_artifact_bytes, MAX_ARTIFACT_BYTES_LIMIT),
+        ("max-row-input-bytes", max_row_input_bytes, MAX_ROW_INPUT_BYTES_LIMIT),
+        ("max-run-input-bytes", max_run_input_bytes, MAX_RUN_INPUT_BYTES_LIMIT),
+    )
+    for name, value, hard_cap in values:
+        if type(value) is not int or not 0 < value <= hard_cap:
+            raise CandidateManifestValidationError(
+                f"{name} must be between 1 and {hard_cap}"
+            )
+
+
 def verify_candidates(
     *,
     manifest: Path,
@@ -164,6 +442,9 @@ def verify_candidates(
     timeout: float = 30.0,
     force: bool = False,
     max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+    max_artifact_bytes: int = DEFAULT_MAX_ARTIFACT_BYTES,
+    max_row_input_bytes: int = DEFAULT_MAX_ROW_INPUT_BYTES,
+    max_run_input_bytes: int = DEFAULT_MAX_RUN_INPUT_BYTES,
     environment: Mapping[str, str] | None = None,
 ) -> dict[str, int]:
     """Validate, execute, and atomically publish deterministic candidate evidence."""
@@ -171,22 +452,40 @@ def verify_candidates(
     if timeout <= 0:
         raise CandidateManifestValidationError("timeout must be greater than zero")
     _validate_max_output_bytes(max_output_bytes)
+    _validate_input_limits(
+        max_artifact_bytes, max_row_input_bytes, max_run_input_bytes
+    )
     try:
         rows = load_manifest(Path(manifest), Path(workspace_root))
     except KeyboardInterrupt as exc:
         raise CandidateVerificationInterrupted("interrupted during manifest validation") from exc
     final_path, partial_path = _validate_output_paths(Path(output), force)
     _reject_output_input_collisions(final_path, partial_path, Path(manifest), rows)
+    _reject_work_dir_input_collisions(Path(work_dir), Path(manifest), rows)
     scratch = _prepare_work_dir(Path(work_dir))
 
     try:
-        input_hashes = [hash_inputs(row) for row in rows]
+        prepared_rows = prepare_candidate_rows(
+            rows,
+            scratch,
+            max_artifact_bytes=max_artifact_bytes,
+            max_row_input_bytes=max_row_input_bytes,
+            max_run_input_bytes=max_run_input_bytes,
+        )
     except KeyboardInterrupt as exc:
-        raise CandidateVerificationInterrupted("interrupted during input hashing") from exc
+        raise CandidateVerificationInterrupted("interrupted during input preparation") from exc
+    except CandidateVerificationPreflightError:
+        raise
     except (OSError, ValueError) as exc:
         raise CandidateVerificationPreflightError(
-            f"could not hash manifest artifacts: {exc}"
+            f"could not prepare manifest artifacts: {exc}"
         ) from exc
+
+    _reject_output_snapshot_collisions(
+        final_path,
+        partial_path,
+        [prepared for prepared in prepared_rows],
+    )
 
     try:
         with partial_path.open("w", encoding="utf-8", newline="\n") as handle:
@@ -215,11 +514,12 @@ def verify_candidates(
     counts = {"rows": len(rows), "passed": 0, "failed": 0}
     try:
         with partial_path.open("w", encoding="utf-8", newline="\n") as handle:
-            for index, (row, hashes) in enumerate(zip(rows, input_hashes), 1):
+            for index, prepared in enumerate(prepared_rows, 1):
+                row = prepared.manifest_row
                 try:
                     evidence = verify_row(
                         row,
-                        input_hashes=hashes,
+                        input_hashes=prepared.input_hashes,
                         toolchain=toolchain,
                         work_dir=scratch,
                         timeout=timeout,
@@ -227,6 +527,7 @@ def verify_candidates(
                         workspace_root=Path(workspace_root),
                         manifest_path=Path(manifest),
                         max_output_bytes=max_output_bytes,
+                        prepared=prepared,
                         environment=environment,
                     )
                 except KeyboardInterrupt:
@@ -234,12 +535,13 @@ def verify_candidates(
                 except Exception as exc:
                     evidence = _internal_evidence(
                         row,
-                        hashes,
+                        prepared.input_hashes,
                         toolchain,
                         str(exc),
                         Path(workspace_root),
                         scratch,
                         Path(manifest),
+                        prepared=prepared,
                     )
                 handle.write(deterministic_json(evidence) + "\n")
                 handle.flush()
@@ -271,6 +573,7 @@ def verify_row(
     workspace_root: Path | None = None,
     manifest_path: Path | None = None,
     max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+    prepared: PreparedCandidateRow | None = None,
     environment: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     _validate_max_output_bytes(max_output_bytes)
@@ -279,10 +582,26 @@ def verify_row(
         f"{hashlib.sha256(row.candidate_id.encode()).hexdigest()[:12]}"
     )
     row_work.mkdir(parents=True, exist_ok=True)
+    if prepared is None:
+        snapshot_root = row_work / "inputs"
+        snapshot_root.mkdir(mode=0o700, parents=True, exist_ok=False)
+        prepared = _prepare_candidate_row(
+            row,
+            snapshot_root,
+            row_index,
+            [0],
+            DEFAULT_MAX_ARTIFACT_BYTES,
+            DEFAULT_MAX_ROW_INPUT_BYTES,
+            DEFAULT_MAX_RUN_INPUT_BYTES,
+        )
+    elif prepared.manifest_row is not row and prepared.manifest_row != row:
+        raise CandidateVerificationPreflightError(
+            "prepared candidate row does not match manifest row"
+        )
     checks = _initial_checks(row.requested_checks)
     diagnostics: list[str] = []
     report = MismatchReport(row.simulation_result_contract, (), (), False)
-    artifact_paths = [path for _, path in row.artifact_paths]
+    artifact_paths = _build_redaction_context(row, prepared)
 
     iverilog = toolchain["iverilog"].path
     vvp = toolchain["vvp"].path
@@ -293,6 +612,7 @@ def verify_row(
         compile_status, diagnostic = _compile_design(
             iverilog,
             row,
+            prepared,
             row_work / "candidate_compile.out",
             row_work,
             timeout,
@@ -317,6 +637,7 @@ def verify_row(
                 iverilog,
                 vvp,
                 row,
+                prepared,
                 row_work / "candidate_simulation.out",
                 row_work,
                 timeout,
@@ -338,6 +659,7 @@ def verify_row(
             status, diagnostic = _lint_design(
                 verilator,
                 row,
+                prepared,
                 row_work,
                 timeout,
                 workspace_root,
@@ -358,6 +680,7 @@ def verify_row(
             status, diagnostic = _synthesize_design(
                 yosys,
                 row,
+                prepared,
                 row_work,
                 timeout,
                 workspace_root,
@@ -383,7 +706,7 @@ def verify_row(
         "testbench_top": row.testbench_top,
         "simulation_result_contract": row.simulation_result_contract,
         "requested_checks": dict(row.requested_checks),
-        "input_hashes": input_hashes,
+        "input_hashes": prepared.input_hashes,
         "toolchain": toolchain_json(toolchain),
         "checks": checks,
         "mismatch_summary": {
@@ -424,6 +747,7 @@ def _initial_checks(requested: Mapping[str, bool]) -> dict[str, Any]:
 def _compile_design(
     iverilog: str,
     row: CandidateRow,
+    prepared: PreparedCandidateRow,
     binary: Path,
     cwd: Path,
     timeout: float,
@@ -440,9 +764,9 @@ def _compile_design(
         row.top_module,
         "-o",
         str(binary),
-        str(row.resolved_paths["candidate_rtl_path"]),
+        str(prepared.candidate_snapshot),
     ]
-    command.extend(str(row.resolved_support_paths[path]) for path in row.support_files)
+    command.extend(str(prepared.support_snapshots[path]) for path in row.support_files)
     result = _run(command, cwd, timeout, max_output_bytes, environment)
     if result.timed_out:
         return _failed("timeout"), _diagnostic(
@@ -467,6 +791,7 @@ def _simulate_design(
     iverilog: str,
     vvp: str,
     row: CandidateRow,
+    prepared: PreparedCandidateRow,
     binary: Path,
     cwd: Path,
     timeout: float,
@@ -483,10 +808,10 @@ def _simulate_design(
         row.testbench_top,
         "-o",
         str(binary),
-        str(row.resolved_paths["candidate_rtl_path"]),
+        str(prepared.candidate_snapshot),
     ]
-    compile_command.extend(str(row.resolved_support_paths[path]) for path in row.support_files)
-    compile_command.append(str(row.resolved_paths["testbench_path"]))
+    compile_command.extend(str(prepared.support_snapshots[path]) for path in row.support_files)
+    compile_command.append(str(prepared.testbench_snapshot))
     compiled = _run(compile_command, cwd, timeout, max_output_bytes, environment)
     if compiled.timed_out:
         return (
@@ -601,6 +926,7 @@ def _simulate_design(
 def _lint_design(
     verilator: str,
     row: CandidateRow,
+    prepared: PreparedCandidateRow,
     cwd: Path,
     timeout: float,
     workspace_root: Path | None,
@@ -615,9 +941,9 @@ def _lint_design(
         "--timing",
         "--top-module",
         row.top_module,
-        str(row.resolved_paths["candidate_rtl_path"]),
+        str(prepared.candidate_snapshot),
     ]
-    command.extend(str(row.resolved_support_paths[path]) for path in row.support_files)
+    command.extend(str(prepared.support_snapshots[path]) for path in row.support_files)
     result = _run(command, cwd, timeout, max_output_bytes, environment)
     if result.timed_out:
         return _failed("timeout"), _diagnostic(
@@ -641,6 +967,7 @@ def _lint_design(
 def _synthesize_design(
     yosys: str,
     row: CandidateRow,
+    prepared: PreparedCandidateRow,
     cwd: Path,
     timeout: float,
     workspace_root: Path | None,
@@ -651,8 +978,8 @@ def _synthesize_design(
 ) -> tuple[dict[str, Any], str | None]:
     script = cwd / "candidate_synthesis.ys"
     files = [
-        row.resolved_paths["candidate_rtl_path"],
-        *(row.resolved_support_paths[path] for path in row.support_files),
+        prepared.candidate_snapshot,
+        *(prepared.support_snapshots[path] for path in row.support_files),
     ]
     script.write_text(
         "\n".join(
@@ -690,17 +1017,23 @@ def _run(
     environment: Mapping[str, str] | None = None,
 ) -> CommandResult:
     _validate_max_output_bytes(max_output_bytes)
-    child_environment = _minimal_environment(cwd, environment)
+    child_environment = _minimal_environment(cwd, environment, command)
     try:
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=child_environment,
-            shell=False,
-        )
+        process_kwargs: dict[str, Any] = {
+            "cwd": cwd,
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "env": child_environment,
+            "shell": False,
+        }
+        if os.name == "posix":
+            process_kwargs["start_new_session"] = True
+        elif os.name == "nt":
+            process_kwargs["creationflags"] = getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+            )
+        process = subprocess.Popen(command, **process_kwargs)
     except OSError as exc:
         return CommandResult(None, str(exc), startup_error=True)
 
@@ -743,7 +1076,7 @@ def _run(
             remaining_time = deadline - time.monotonic()
             if remaining_time <= 0:
                 timed_out = True
-                _terminate_process(process)
+                _terminate_process_tree(process)
                 break
             try:
                 chunk = output_queue.get(timeout=min(remaining_time, 0.05))
@@ -751,7 +1084,7 @@ def _run(
                 continue
             collect(chunk)
             if output_limit_exceeded:
-                _terminate_process(process)
+                _terminate_process_tree(process)
                 break
 
         drain_deadline = time.monotonic() + 1.0
@@ -765,10 +1098,10 @@ def _run(
         try:
             returncode = process.wait(timeout=1.0)
         except subprocess.TimeoutExpired:
-            _terminate_process(process)
+            _terminate_process_tree(process)
             returncode = process.wait(timeout=1.0)
     except KeyboardInterrupt:
-        _terminate_process(process)
+        _terminate_process_tree(process)
         try:
             process.wait(timeout=1.0)
         except subprocess.TimeoutExpired:
@@ -777,6 +1110,7 @@ def _run(
     finally:
         if process.stdout is not None:
             process.stdout.close()
+        reader.join(timeout=_READER_JOIN_SECONDS)
     return CommandResult(
         returncode,
         bytes(output).decode("utf-8", errors="replace"),
@@ -785,7 +1119,42 @@ def _run(
     )
 
 
-def _terminate_process(process: subprocess.Popen[bytes]) -> None:
+def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
+    """Terminate a verifier-owned process group without touching our group."""
+
+    if os.name == "posix":
+        for termination_signal in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(process.pid, termination_signal)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                if process.poll() is None:
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+            if termination_signal == signal.SIGTERM:
+                deadline = time.monotonic() + _PROCESS_GROUP_GRACE_SECONDS
+                while process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+        return
+
+    if os.name == "nt":
+        try:
+            process.send_signal(getattr(signal, "CTRL_BREAK_EVENT", signal.SIGTERM))
+        except (OSError, ValueError):
+            pass
+        deadline = time.monotonic() + _PROCESS_GROUP_GRACE_SECONDS
+        while process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+        return
+
     if process.poll() is None:
         try:
             process.kill()
@@ -796,9 +1165,20 @@ def _terminate_process(process: subprocess.Popen[bytes]) -> None:
 def _minimal_environment(
     cwd: Path,
     extra: Mapping[str, str] | None = None,
+    command: list[str] | None = None,
 ) -> dict[str, str]:
+    path_entries: list[str] = []
+    for raw_path in (os.defpath, os.environ.get("PATH", "")):
+        for entry in raw_path.split(os.pathsep):
+            if entry and os.path.isabs(entry):
+                path_entries.append(entry)
+    if command:
+        executable = Path(command[0])
+        if executable.is_absolute():
+            path_entries.insert(0, str(executable.parent))
+    path_entries = list(dict.fromkeys(path_entries))
     environment = {
-        "PATH": os.defpath,
+        "PATH": os.pathsep.join(path_entries),
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "TMPDIR": str(cwd),
@@ -861,32 +1241,143 @@ def _validate_max_output_bytes(value: int) -> None:
         )
 
 
+def _build_redaction_context(
+    row: CandidateRow,
+    prepared: PreparedCandidateRow | None = None,
+) -> DiagnosticRedactionContext:
+    logical_paths = [
+        row.candidate_rtl_path,
+        row.testbench_path,
+        *row.support_files,
+    ]
+    original_paths = [path for _, path in row.artifact_paths]
+    source_paths = (
+        [
+            prepared.candidate_snapshot,
+            prepared.testbench_snapshot,
+            *prepared.support_snapshots.values(),
+        ]
+        if prepared is not None
+        else original_paths
+    )
+    context = _build_redaction_context_from_paths(
+        [*logical_paths, *(str(path) for path in original_paths), *(str(path) for path in source_paths)],
+        source_paths,
+    )
+    return context
+
+
+def _build_redaction_context_from_paths(
+    path_strings: list[str],
+    source_paths: list[Path],
+) -> DiagnosticRedactionContext:
+    source_lines: set[str] = set()
+    long_tokens: set[str] = set()
+    conservative = False
+    for source_path in source_paths:
+        try:
+            descriptor = _open_regular_source(source_path)
+            with os.fdopen(descriptor, "rb", closefd=True) as handle:
+                descriptor = -1
+                line_count = 0
+                scanned_bytes = 0
+                pending = bytearray()
+                while True:
+                    chunk = handle.read(_COPY_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    scanned_bytes += len(chunk)
+                    if scanned_bytes > _MAX_DIAGNOSTIC_FALLBACK_BYTES:
+                        conservative = True
+                        break
+                    pending.extend(chunk)
+                    while True:
+                        newline = pending.find(b"\n")
+                        if newline < 0:
+                            if len(pending) > _MAX_DIAGNOSTIC_INDEX_LINE_BYTES:
+                                conservative = True
+                                pending.clear()
+                            break
+                        raw_line = bytes(pending[:newline]).rstrip(b"\r")
+                        del pending[: newline + 1]
+                        line_count += 1
+                        if line_count > _MAX_DIAGNOSTIC_INDEX_LINES:
+                            conservative = True
+                            pending.clear()
+                            break
+                        if len(raw_line) > _MAX_DIAGNOSTIC_INDEX_LINE_BYTES:
+                            conservative = True
+                            continue
+                        line = raw_line.decode("utf-8", errors="replace")
+                        if line:
+                            source_lines.add(line)
+                            for token in re.findall(r"\S{2,}", line):
+                                if len(long_tokens) >= _MAX_DIAGNOSTIC_INDEX_TOKENS:
+                                    conservative = True
+                                    break
+                                long_tokens.add(token)
+                    if conservative and line_count > _MAX_DIAGNOSTIC_INDEX_LINES:
+                        break
+                if pending and len(pending) <= _MAX_DIAGNOSTIC_INDEX_LINE_BYTES:
+                    line = bytes(pending).rstrip(b"\r").decode(
+                        "utf-8", errors="replace"
+                    )
+                    if line:
+                        source_lines.add(line)
+                        for token in re.findall(r"\S{2,}", line):
+                            if len(long_tokens) >= _MAX_DIAGNOSTIC_INDEX_TOKENS:
+                                conservative = True
+                                break
+                            long_tokens.add(token)
+        except (OSError, CandidateVerificationPreflightError):
+            conservative = True
+    return DiagnosticRedactionContext(
+        tuple(dict.fromkeys(path_strings)),
+        frozenset(source_lines),
+        frozenset(long_tokens),
+        conservative,
+    )
+
+
 def _diagnostic(
     stage: str,
     result: CommandResult,
     workspace_root: Path | None,
     work_dir: Path,
     manifest_path: Path | None,
-    artifact_paths: list[Path],
+    artifact_paths: list[Path] | DiagnosticRedactionContext,
     *,
     only_if_output: bool = False,
 ) -> str | None:
     if only_if_output and not result.output.strip() and not result.output_limit_exceeded:
         return None
+    redaction_context = (
+        artifact_paths
+        if isinstance(artifact_paths, DiagnosticRedactionContext)
+        else _build_redaction_context_from_paths(
+            [str(path) for path in artifact_paths], artifact_paths
+        )
+    )
+    include_output = stage != "simulation" and not redaction_context.conservative
     if result.output_limit_exceeded:
-        message = f"{stage}: output_limit_exceeded returncode={result.returncode} {result.output}"
+        message = f"{stage}: output_limit_exceeded returncode={result.returncode}"
+        if include_output:
+            message += f" {result.output}"
     elif result.timed_out:
-        message = f"{stage}: timeout"
+        message = f"{stage}: timeout=true returncode={result.returncode}"
     elif result.startup_error:
-        message = f"{stage}: process_start_failed"
+        message = f"{stage}: process_start_failed returncode={result.returncode}"
     else:
-        message = f"{stage}: returncode={result.returncode} {result.output}"
+        message = f"{stage}: returncode={result.returncode}"
+        if include_output:
+            message += f" {result.output}"
     return _sanitize_candidate_diagnostic(
         message,
         workspace_root=workspace_root,
         work_dir=work_dir,
         manifest_path=manifest_path,
-        artifact_paths=artifact_paths,
+        artifact_paths=[],
+        redaction_context=redaction_context,
     )
 
 
@@ -897,24 +1388,25 @@ def _sanitize_candidate_diagnostic(
     work_dir: Path | None,
     manifest_path: Path | None,
     artifact_paths: list[Path],
+    redaction_context: DiagnosticRedactionContext | None = None,
 ) -> str:
     text = str(value).replace("\x00", "")
-    redactions: list[str] = []
-    for path in artifact_paths:
-        redactions.extend((str(path), str(path.resolve())))
-        try:
-            content = path.read_bytes().decode("utf-8", errors="replace")
-        except OSError:
-            content = ""
-        if content:
-            redactions.append(content)
-            redactions.extend(line for line in content.splitlines() if line.strip())
-            redactions.extend(
-                token
-                for token in re.findall(r"[A-Za-z_][A-Za-z0-9_$]{15,}", content)
-            )
-    for secret in sorted(set(redactions), key=len, reverse=True):
+    context = redaction_context or _build_redaction_context_from_paths(
+        [str(path) for path in artifact_paths], artifact_paths
+    )
+    for secret in sorted(context.path_strings, key=len, reverse=True):
         text = text.replace(secret, "<source omitted>")
+    for secret in sorted(context.source_lines, key=len, reverse=True):
+        text = text.replace(secret, "<source omitted>")
+    for secret in sorted(context.long_tokens, key=len, reverse=True):
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", secret):
+            text = re.sub(
+                rf"(?<![A-Za-z0-9_$]){re.escape(secret)}(?![A-Za-z0-9_$])",
+                "<source omitted>",
+                text,
+            )
+        else:
+            text = text.replace(secret, "<source omitted>")
     text = _MANAGED_RUN_RE.sub("<work>", text)
     text = re.sub(
         r"(?i)\b(?:authorization\s*:\s*bearer|bearer)\s+[^\s,;]+",
@@ -959,6 +1451,7 @@ def _internal_evidence(
     workspace_root: Path,
     work_dir: Path,
     manifest_path: Path | None = None,
+    prepared: PreparedCandidateRow | None = None,
 ) -> dict[str, Any]:
     checks = _initial_checks(row.requested_checks)
     checks["compile"]["candidate"] = _failed("internal_error")
@@ -966,12 +1459,18 @@ def _internal_evidence(
     for check_name in ("lint", "synthesis"):
         if row.requested_checks[check_name]:
             checks[check_name]["candidate"] = _unavailable("internal_error")
+    redaction_context = (
+        _build_redaction_context(row, prepared)
+        if prepared is not None
+        else None
+    )
     diagnostic = _sanitize_candidate_diagnostic(
         f"internal row error: {error}",
         workspace_root=workspace_root,
         work_dir=work_dir,
         manifest_path=manifest_path,
         artifact_paths=[path for _, path in row.artifact_paths],
+        redaction_context=redaction_context,
     )
     return {
         "schema_version": EVIDENCE_SCHEMA_VERSION,
@@ -983,7 +1482,7 @@ def _internal_evidence(
         "testbench_top": row.testbench_top,
         "simulation_result_contract": row.simulation_result_contract,
         "requested_checks": dict(row.requested_checks),
-        "input_hashes": input_hashes,
+        "input_hashes": prepared.input_hashes,
         "toolchain": toolchain_json(toolchain),
         "checks": checks,
         "mismatch_summary": {
@@ -1057,6 +1556,46 @@ def _reject_output_input_collisions(
             if _paths_alias(candidate, protected_path):
                 raise CandidateVerificationPreflightError(
                     f"{candidate_label} aliases protected input {protected_label}: {candidate}"
+                )
+
+
+def _reject_work_dir_input_collisions(
+    work_dir: Path,
+    manifest_path: Path,
+    rows: list[CandidateRow],
+) -> None:
+    candidates = [("manifest", manifest_path.expanduser().resolve())]
+    for row in rows:
+        candidates.extend(
+            (f"{row.candidate_id}:{label}", path)
+            for label, path in row.artifact_paths
+        )
+    for label, protected in candidates:
+        if _paths_alias(work_dir.expanduser(), protected):
+            raise CandidateVerificationPreflightError(
+                f"work-dir aliases protected input {label}: {work_dir}"
+            )
+
+
+def _reject_output_snapshot_collisions(
+    final: Path,
+    partial: Path,
+    prepared_rows: list[PreparedCandidateRow],
+) -> None:
+    snapshots: list[tuple[str, Path]] = []
+    for prepared in prepared_rows:
+        row = prepared.manifest_row
+        snapshots.append((f"{row.candidate_id}:candidate_snapshot", prepared.candidate_snapshot))
+        snapshots.append((f"{row.candidate_id}:testbench_snapshot", prepared.testbench_snapshot))
+        snapshots.extend(
+            (f"{row.candidate_id}:support_snapshot:{logical}", path)
+            for logical, path in prepared.support_snapshots.items()
+        )
+    for output_label, output_path in (("output", final), ("managed partial output", partial)):
+        for snapshot_label, snapshot_path in snapshots:
+            if _paths_alias(output_path, snapshot_path):
+                raise CandidateVerificationPreflightError(
+                    f"{output_label} aliases snapshot {snapshot_label}: {output_path}"
                 )
 
 
