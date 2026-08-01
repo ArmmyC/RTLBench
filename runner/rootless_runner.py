@@ -343,6 +343,9 @@ import hashlib
 import json
 import os
 import stat
+from pathlib import Path
+
+from rtlbench.candidate_evidence import sha256_workspace_tree
 
 _ROOT = "/input"
 _CHUNK = 65536
@@ -357,7 +360,11 @@ def _regular(path):
         metadata = os.lstat(path)
     except OSError:
         _fail()
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or not os.access(path, os.R_OK)
+    ):
         _fail()
 
 
@@ -366,7 +373,7 @@ def _directory(path):
         mode = os.lstat(path).st_mode
     except OSError:
         _fail()
-    if not stat.S_ISDIR(mode):
+    if not stat.S_ISDIR(mode) or not os.access(path, os.R_OK | os.X_OK):
         _fail()
 
 
@@ -391,10 +398,11 @@ def _file_hash(path):
     return digest.hexdigest()
 
 
-def _workspace_hash(root):
+def _validate_workspace(root):
     _directory(root)
-    digest = hashlib.sha256()
-    def visit(current):
+    pending = [root]
+    while pending:
+        current = pending.pop()
         try:
             entries = sorted(os.scandir(current), key=lambda item: item.name)
         except OSError:
@@ -407,18 +415,15 @@ def _workspace_hash(root):
                 metadata = entry.stat(follow_symlinks=False)
             except OSError:
                 _fail()
-            relative = os.path.relpath(path, root).replace(os.sep, "/")
+            if entry.name.casefold() == "reference.sv":
+                _fail()
             if stat.S_ISDIR(metadata.st_mode):
-                digest.update(b"D\0" + relative.encode() + b"\n")
-                visit(path)
+                _directory(path)
+                pending.append(path)
             elif stat.S_ISREG(metadata.st_mode):
-                if entry.name.casefold() == "reference.sv":
-                    _fail()
-                digest.update(b"F\0" + relative.encode() + b"\0" + _file_hash(path).encode() + b"\n")
+                _regular(path)
             else:
                 _fail()
-    visit(root)
-    return digest.hexdigest()
 
 
 try:
@@ -426,9 +431,13 @@ try:
     names = sorted(os.listdir(_ROOT))
     if names != ["candidate_manifest.jsonl", "workspace"]:
         _fail()
-    manifest = _file_hash(os.path.join(_ROOT, "candidate_manifest.jsonl"))
-    workspace = _workspace_hash(os.path.join(_ROOT, "workspace"))
-    print(json.dumps({"manifest_sha256": manifest, "workspace_tree_sha256": workspace}, sort_keys=True, separators=(",", ":")))
+    manifest_path = os.path.join(_ROOT, "candidate_manifest.jsonl")
+    _regular(manifest_path)
+    manifest = _file_hash(manifest_path)
+    workspace_path = Path(_ROOT) / "workspace"
+    _validate_workspace(workspace_path)
+    workspace_hash = sha256_workspace_tree(workspace_path)
+    print(json.dumps({"manifest_sha256": manifest, "workspace_tree_sha256": workspace_hash}, sort_keys=True, separators=(",", ":")))
 except Exception:
     raise SystemExit(1)
 '''.strip()
@@ -1223,11 +1232,23 @@ def _probe_input_volume(
         "workspace_tree_sha256",
     }:
         raise RunnerError("runtime-user input probe returned unexpected output")
-    if (
-        value["manifest_sha256"] != expected_manifest_sha256
-        or value["workspace_tree_sha256"] != expected_workspace_tree_sha256
-    ):
-        raise RunnerError("staged input hashes do not match canonical handoff hashes")
+    manifest_matches = value["manifest_sha256"] == expected_manifest_sha256
+    workspace_matches = (
+        value["workspace_tree_sha256"] == expected_workspace_tree_sha256
+    )
+    if not manifest_matches and not workspace_matches:
+        raise RunnerError(
+            "staged manifest and workspace-tree hashes do not match "
+            "canonical handoff hashes"
+        )
+    if not manifest_matches:
+        raise RunnerError(
+            "staged manifest hash does not match canonical handoff hash"
+        )
+    if not workspace_matches:
+        raise RunnerError(
+            "staged workspace-tree hash does not match canonical handoff hash"
+        )
 
 
 def run_isolated(

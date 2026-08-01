@@ -168,6 +168,11 @@ must report the same manifest and workspace-tree hashes as the canonical host
 handoff before candidate execution. Cleanup removes managed containers, the
 temporary volume, the private archive, and launcher temporary directories;
 cleanup failure fails closed without publishing evidence.
+The host launcher and the runtime-user probe use the same canonical
+`rtlbench.candidate_evidence.sha256_workspace_tree` implementation. The probe
+still performs an independent validation pass for staged types, readability,
+traversal, and forbidden entries; that pass does not define another hash
+serialization format.
 
 Both the image and launcher pin module discovery to
 `PYTHONPATH=/opt/rtlbench/src`. This value is fixed to the immutable image

@@ -195,7 +195,10 @@ The population helper is the only fixed staging operation allowed to run as
 UID 0. It has no shell, host bind mounts, Docker/Podman socket, credentials,
 or network and cannot execute RTL, testbench, or manifest content. The
 runtime-user probe rejects links, special files, unexpected paths, unreadable
-files, and hash disagreement before candidate execution. Cleanup terminates
+files, and hash disagreement before candidate execution. The host launcher and
+probe use the canonical `rtlbench.candidate_evidence.sha256_workspace_tree`
+implementation; the probe's separate validation pass does not define another
+hash serialization format. Cleanup terminates
 managed processes, removes the temporary volume, closes/deletes the private
 archive, and deletes launcher temporary directories. Failure to remove the
 managed volume fails closed and prevents final evidence or sidecar

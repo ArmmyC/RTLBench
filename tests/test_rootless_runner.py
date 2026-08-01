@@ -2,6 +2,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -142,6 +143,84 @@ def _tree_hashes(root: Path) -> dict[str, str]:
     return result
 
 
+def _legacy_recursive_workspace_hash(root: Path) -> str:
+    """Reproduce the pre-fix depth-first probe ordering for regression tests."""
+
+    digest = hashlib.sha256()
+
+    def file_hash(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def visit(current: Path) -> None:
+        for path in sorted(current.iterdir(), key=lambda item: item.name):
+            relative = path.relative_to(root).as_posix()
+            if path.is_dir():
+                digest.update(b"D\0" + relative.encode() + b"\n")
+                visit(path)
+            else:
+                digest.update(
+                    b"F\0"
+                    + relative.encode()
+                    + b"\0"
+                    + file_hash(path).encode()
+                    + b"\n"
+                )
+
+    visit(root)
+    return digest.hexdigest()
+
+
+def test_probe_uses_canonical_workspace_hash_for_mixed_siblings(tmp_path: Path):
+    volume = tmp_path / "volume"
+    workspace = volume / "workspace"
+    (workspace / "alpha" / "nested").mkdir(parents=True)
+    (workspace / "beta").mkdir()
+    (volume / "candidate_manifest.jsonl").write_text("manifest\n", encoding="utf-8")
+    (workspace / "root_file.sv").write_text("root\n", encoding="utf-8")
+    (workspace / "alpha" / "alpha_file.sv").write_text("alpha\n", encoding="utf-8")
+    (workspace / "alpha" / "nested" / "nested_file.sv").write_text(
+        "nested\n", encoding="utf-8"
+    )
+    (workspace / "beta" / "beta_file.sv").write_text("beta\n", encoding="utf-8")
+
+    for path in volume.rglob("*"):
+        if path.is_file():
+            path.chmod(0o444)
+    for path in sorted(volume.rglob("*"), reverse=True):
+        if path.is_dir():
+            path.chmod(0o555)
+    volume.chmod(0o555)
+
+    root_literal = '_ROOT = "/input"'
+    program = runner.PROBE_INPUT_VOLUME_PROGRAM
+    assert program.count(root_literal) == 1
+    rewritten = program.replace(
+        root_literal,
+        "_ROOT = " + repr(str(volume)),
+        1,
+    )
+    environment = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONPATH": str(runner.SOURCE_ROOT),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", rewritten],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    reported = json.loads(result.stdout)
+    expected = runner.sha256_workspace_tree(workspace)
+    assert reported["manifest_sha256"] == runner.sha256_file(
+        volume / "candidate_manifest.jsonl"
+    )
+    assert reported["workspace_tree_sha256"] == expected
+    assert _legacy_recursive_workspace_hash(workspace) != expected
+
+
 def _fake_podman(tmp_path: Path, *, mode: str) -> tuple[Path, Path]:
     return _fake_runtime(tmp_path, mode=mode, backend="podman")
 
@@ -175,7 +254,9 @@ def _fake_runtime(
     body = textwrap.dedent(
         f"""
         #!{sys.executable}
+        import contextlib
         import hashlib
+        import io
         import json
         import os
         import shutil
@@ -274,38 +355,75 @@ def _fake_runtime(
                     else:
                         archive.extractall(input_root)
                 raise SystemExit(0)
-            def file_hash(path):
-                digest = hashlib.sha256()
-                with path.open("rb") as handle:
-                    while chunk := handle.read(65536):
-                        digest.update(chunk)
-                return digest.hexdigest()
-            def workspace_hash(root):
-                digest = hashlib.sha256()
-                for current, directories, files in os.walk(root, topdown=True, followlinks=False):
-                    directories.sort()
-                    files.sort()
-                    for name in directories:
-                        path = Path(current) / name
-                        digest.update(b"D\\0" + path.relative_to(root).as_posix().encode() + b"\\n")
-                    for name in files:
-                        path = Path(current) / name
-                        digest.update(b"F\\0" + path.relative_to(root).as_posix().encode() + b"\\0" + file_hash(path).encode() + b"\\n")
-                return digest.hexdigest()
             if {mode!r} == "probe_failure":
                 print("synthetic probe failure", file=sys.stderr, flush=True)
                 raise SystemExit(1)
-            if {mode!r} == "probe_mismatch":
-                print(json.dumps({{
-                    "manifest_sha256": "0" * 64,
-                    "workspace_tree_sha256": "0" * 64,
-                }}, sort_keys=True, separators=(",", ":")))
+            if {mode!r} == "probe_malformed":
+                print("not-json")
                 raise SystemExit(0)
-            print(json.dumps({{
-                "manifest_sha256": file_hash(input_root / "candidate_manifest.jsonl"),
-                "workspace_tree_sha256": workspace_hash(input_root / "workspace"),
-            }}, sort_keys=True, separators=(",", ":")))
-            raise SystemExit(0)
+            if {mode!r} == "probe_unexpected":
+                print(json.dumps({{"unexpected": True}}))
+                raise SystemExit(0)
+            if {mode!r} == "probe_excessive":
+                print("x" * {runner.PROBE_OUTPUT_LIMIT_BYTES + 1})
+                raise SystemExit(0)
+            if program != {runner.PROBE_INPUT_VOLUME_PROGRAM!r}:
+                raise SystemExit(2)
+            root_literal = '_ROOT = "/input"'
+            if program.count(root_literal) != 1:
+                raise SystemExit(2)
+            rewritten = program.replace(
+                root_literal,
+                "_ROOT = " + repr(str(input_root)),
+                1,
+            )
+            sys.path.insert(0, {str(runner.SOURCE_ROOT)!r})
+            namespace = {{
+                "__name__": "__main__",
+                "__file__": "<rtlbench-input-probe>",
+            }}
+            captured = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(captured):
+                    exec(
+                        compile(
+                            rewritten,
+                            "<rtlbench-input-probe>",
+                            "exec",
+                        ),
+                        namespace,
+                        namespace,
+                    )
+            except SystemExit as error:
+                exit_code = error.code
+            else:
+                exit_code = 0
+            probe_output = captured.getvalue()
+            if exit_code == 0 and {mode!r} in {{
+                "probe_manifest_mismatch",
+                "probe_workspace_mismatch",
+                "probe_both_mismatch",
+                "probe_mismatch",
+            }}:
+                probe_value = json.loads(probe_output)
+                if {mode!r} == "probe_manifest_mismatch":
+                    probe_value["manifest_sha256"] = "0" * 64
+                elif {mode!r} == "probe_workspace_mismatch":
+                    probe_value["workspace_tree_sha256"] = "0" * 64
+                else:
+                    probe_value["manifest_sha256"] = "0" * 64
+                    probe_value["workspace_tree_sha256"] = "0" * 64
+                probe_output = json.dumps(
+                    probe_value,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ) + "\\n"
+            record[-1]["probe_program"] = program
+            record[-1]["probe_output"] = probe_output
+            log.write_text(json.dumps(record), encoding="utf-8")
+            if probe_output:
+                print(probe_output, end="")
+            raise SystemExit(exit_code)
         output_mount = next(value for value in mounts if "dst=/output" in value)
         output_root = Path(next(part[4:] for part in output_mount.split(",") if part.startswith("src=")))
         if {mode!r} == "startup_failure":
@@ -1098,6 +1216,21 @@ def test_runtime_stages_restrictive_handoff_before_candidate_and_cleans_volume(
     assert candidate[candidate.index("--user") + 1] == "65532:65532"
     assert population[population.index("--entrypoint") + 1] == "/usr/local/bin/python"
     assert probe[probe.index("--entrypoint") + 1] == "/usr/local/bin/python"
+    assert probe[probe.index("-c") + 1] == runner.PROBE_INPUT_VOLUME_PROGRAM
+    probe_record = next(
+        item
+        for item in records
+        if item["argv"] == probe
+    )
+    assert probe_record["probe_program"] == runner.PROBE_INPUT_VOLUME_PROGRAM
+    assert json.loads(probe_record["probe_output"]) == {
+        "manifest_sha256": runner.sha256_file(
+            handoff / "candidate_manifest.jsonl"
+        ),
+        "workspace_tree_sha256": runner.sha256_workspace_tree(
+            handoff / "workspace"
+        ),
+    }
     candidate_input_mount = next(
         item[1]
         for item in zip(candidate, candidate[1:])
@@ -1114,11 +1247,46 @@ def test_runtime_stages_restrictive_handoff_before_candidate_and_cleans_volume(
     assert {path: stat.S_IMODE(path.stat().st_mode) for path in [handoff, *sorted(handoff.rglob("*"))]} == original_modes
 
 
-def test_candidate_does_not_start_when_runtime_probe_hashes_disagree(tmp_path: Path):
+@pytest.mark.parametrize(
+    ("mode", "message"),
+    [
+        (
+            "probe_manifest_mismatch",
+            "staged manifest hash does not match canonical handoff hash",
+        ),
+        (
+            "probe_workspace_mismatch",
+            "staged workspace-tree hash does not match canonical handoff hash",
+        ),
+        (
+            "probe_both_mismatch",
+            "staged manifest and workspace-tree hashes do not match canonical handoff hashes",
+        ),
+        (
+            "probe_malformed",
+            "runtime-user input probe returned malformed output",
+        ),
+        (
+            "probe_unexpected",
+            "runtime-user input probe returned unexpected output",
+        ),
+        (
+            "probe_excessive",
+            "runtime-user input probe produced excessive output",
+        ),
+        (
+            "probe_failure",
+            "runtime-user input probe failed with status 1",
+        ),
+    ],
+)
+def test_candidate_does_not_start_when_runtime_probe_is_invalid(
+    tmp_path: Path, mode: str, message: str
+):
     handoff = _make_handoff(tmp_path / "handoff")
-    fake_docker, log = _fake_docker(tmp_path, mode="probe_mismatch")
+    fake_docker, log = _fake_docker(tmp_path, mode=mode)
     output = tmp_path / "evidence.jsonl"
-    with pytest.raises(runner.RunnerError, match="staged input hashes"):
+    with pytest.raises(runner.RunnerError, match=re.escape(message)):
         runner.run_isolated(
             image=IMAGE,
             input_root=handoff,
