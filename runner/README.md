@@ -35,17 +35,26 @@ configuration versions as image labels:
   --tag localhost/rtlbench-runner:pilot \
   --rtlbench-commit "$(git rev-parse HEAD)" \
   --python-version <exact-python-version> \
-  --iverilog-version <exact-iverilog-deb-version> \
-  --vvp-version <exact-vvp-version> \
-  --verilator-version <exact-verilator-deb-version> \
-  --yosys-version <exact-yosys-deb-version>
+  --iverilog-package-version <exact-iverilog-package-version> \
+  --iverilog-version <exact-iverilog-runtime-version> \
+  --vvp-version <exact-vvp-runtime-version> \
+  --verilator-package-version <exact-verilator-package-version> \
+  --verilator-version <exact-verilator-runtime-version> \
+  --yosys-package-version <exact-yosys-package-version> \
+  --yosys-version <exact-yosys-runtime-version>
 ```
 
-Build with `--pull=never`, then inspect the resulting image and use only its
+The build script requires that the commit argument exactly match a clean
+checked-out `git rev-parse HEAD`. During the image build, Python, installed
+Debian package versions, and executable-reported tool versions are checked
+against the supplied values; a mismatch fails the build. Build with
+`--pull=never`, then inspect the resulting image and use only its
 digest-qualified reference with the launcher. The launcher requires all
 identity labels and emits a deterministic `candidate_evidence.jsonl.runner.json`
-sidecar containing the image digest, RTLBench commit, tool versions, and
-`rtlbench_rootless_runner_v0.1`; it contains no timestamps or host paths.
+sidecar containing the image digest, RTLBench commit, tool versions,
+rootless/network/resource policies, the manifest SHA-256, the deterministic
+workspace-tree SHA-256, and the final evidence SHA-256. It contains no
+timestamps or host paths.
 
 ## Run a handoff
 
@@ -54,9 +63,9 @@ The output file must be outside that read-only directory:
 
 ```bash
 python runner/run_rootless.py \
-  --image registry.example/rtlbench-runner@sha256:<immutable-image-digest> \
+  --image localhost/rtlbench-runner@sha256:<immutable-image-digest> \
   --input /path/to/attempt_01 \
-  --output /path/to/attempt_01/candidate_evidence.jsonl
+  --output /path/to/isolated-output/candidate_evidence.jsonl
 ```
 
 Inside the image the launcher executes exactly:
@@ -78,6 +87,10 @@ internal failures are normal evidence rows and are preserved. If the outer
 wall clock expires or the container fails before final publication, a managed
 partial file is copied beside the requested output and the launcher returns a
 non-zero status.
+
+The output path must remain outside the read-only input handoff. After the
+isolated run and evidence validation, copy the final evidence into the
+canonical RTLSpecializer attempt directory.
 
 Do not run the launcher against a real candidate until the synthetic runner
 acceptance suite has passed in the same immutable image. The acceptance suite

@@ -5,36 +5,57 @@ ARG RTLBench_COMMIT
 ARG RUNNER_CONFIG_VERSION
 ARG PYTHON_VERSION
 ARG IVERILOG_VERSION
+ARG IVERILOG_PACKAGE_VERSION
 ARG VVP_VERSION
 ARG VERILATOR_VERSION
+ARG VERILATOR_PACKAGE_VERSION
 ARG YOSYS_VERSION
+ARG YOSYS_PACKAGE_VERSION
 
 RUN test -n "${RTLBench_COMMIT}" \
     && test -n "${RUNNER_CONFIG_VERSION}" \
     && test -n "${PYTHON_VERSION}" \
     && test -n "${IVERILOG_VERSION}" \
+    && test -n "${IVERILOG_PACKAGE_VERSION}" \
     && test -n "${VVP_VERSION}" \
     && test -n "${VERILATOR_VERSION}" \
-    && test -n "${YOSYS_VERSION}"
+    && test -n "${VERILATOR_PACKAGE_VERSION}" \
+    && test -n "${YOSYS_VERSION}" \
+    && test -n "${YOSYS_PACKAGE_VERSION}"
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
-        iverilog="${IVERILOG_VERSION}" \
-        verilator="${VERILATOR_VERSION}" \
-        yosys="${YOSYS_VERSION}" \
+        iverilog="${IVERILOG_PACKAGE_VERSION}" \
+        verilator="${VERILATOR_PACKAGE_VERSION}" \
+        yosys="${YOSYS_PACKAGE_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md /opt/rtlbench/
 COPY src /opt/rtlbench/src
 COPY runner/runner_config.json /opt/rtlbench/runner_config.json
 
+RUN PYTHONPATH=/opt/rtlbench/src python -m rtlbench.build_identity \
+    --python-version "${PYTHON_VERSION}" \
+    --iverilog-package-version "${IVERILOG_PACKAGE_VERSION}" \
+    --iverilog-version "${IVERILOG_VERSION}" \
+    --vvp-version "${VVP_VERSION}" \
+    --verilator-package-version "${VERILATOR_PACKAGE_VERSION}" \
+    --verilator-version "${VERILATOR_VERSION}" \
+    --yosys-package-version "${YOSYS_PACKAGE_VERSION}" \
+    --yosys-version "${YOSYS_VERSION}"
+
 WORKDIR /opt/rtlbench
 RUN groupadd --gid 65532 rtlbench \
     && useradd --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin rtlbench \
     && mkdir -p /tmp/home /work \
     && chown 65532:65532 /tmp/home /work \
-    && printf '%s\\n' '#!/bin/sh' 'exec python -m rtlbench.cli "$$@"' > /usr/local/bin/rtlbench \
-    && chmod 0555 /usr/local/bin/rtlbench
+    && printf '%s\n' \
+        '#!/bin/sh' \
+        'exec python -m rtlbench.cli "$@"' \
+        > /usr/local/bin/rtlbench \
+    && chmod 0555 /usr/local/bin/rtlbench \
+    && test "$(sed -n '2p' /usr/local/bin/rtlbench)" = 'exec python -m rtlbench.cli "$@"' \
+    && PYTHONPATH=/opt/rtlbench/src /usr/local/bin/rtlbench --help >/dev/null
 
 ENV HOME=/tmp/home \
     TMPDIR=/tmp \

@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from runner import rootless_runner as runner
+from rtlbench import build_identity
 import rtlbench.candidate_verification as verification
 
 
@@ -26,10 +28,60 @@ LABELS = {
 }
 
 
-def _evidence(failure_category: str = "passed", accepted: bool = True) -> dict:
+def _evidence_for_category(failure_category: str = "passed") -> dict:
     requested = {"compile": True, "simulation": True, "lint": False, "synthesis": False}
-    passed = {"attempted": True, "passed": accepted, "reason": None}
+    compile_status = {"attempted": True, "passed": True, "reason": None}
+    simulation_status = {"attempted": True, "passed": True, "reason": None}
     not_requested = {"attempted": False, "passed": None, "reason": "not_requested"}
+    reported_counts = [0]
+    reported_sample_counts = [1]
+    maximum_count = 0
+    timeout_reported = False
+    accepted = True
+    if failure_category == "compile_failure":
+        compile_status = {"attempted": True, "passed": False, "reason": "compile_failure"}
+        simulation_status = {"attempted": False, "passed": None, "reason": "compile_failure"}
+        reported_counts = []
+        reported_sample_counts = []
+        maximum_count = None
+        accepted = False
+    elif failure_category == "functional_mismatch":
+        simulation_status = {"attempted": True, "passed": False, "reason": "functional_mismatch"}
+        reported_counts = [1]
+        maximum_count = 1
+        accepted = False
+    elif failure_category == "timeout":
+        simulation_status = {"attempted": True, "passed": False, "reason": "timeout"}
+        reported_counts = []
+        reported_sample_counts = []
+        maximum_count = None
+        timeout_reported = True
+        accepted = False
+    elif failure_category == "simulation_result_missing":
+        simulation_status = {
+            "attempted": True,
+            "passed": False,
+            "reason": "simulation_result_missing",
+        }
+        reported_counts = []
+        reported_sample_counts = []
+        maximum_count = None
+        accepted = False
+    elif failure_category == "simulation_failure":
+        simulation_status = {"attempted": True, "passed": False, "reason": "simulation_failure"}
+        reported_counts = []
+        reported_sample_counts = []
+        maximum_count = None
+        accepted = False
+    elif failure_category == "internal_error":
+        compile_status = {"attempted": True, "passed": False, "reason": "internal_error"}
+        simulation_status = {"attempted": False, "passed": None, "reason": "internal_error"}
+        reported_counts = []
+        reported_sample_counts = []
+        maximum_count = None
+        accepted = False
+    elif failure_category != "passed":
+        raise AssertionError(f"unsupported synthetic category: {failure_category}")
     return {
         "schema_version": "rtl_candidate_evidence_v0.1",
         "candidate_id": "synthetic_candidate_attempt_01",
@@ -40,20 +92,27 @@ def _evidence(failure_category: str = "passed", accepted: bool = True) -> dict:
         "testbench_top": "tb",
         "simulation_result_contract": "mismatch_count_v1",
         "requested_checks": requested,
-        "input_hashes": {"candidate_rtl": "1" * 64, "testbench": "2" * 64},
-        "toolchain": {"iverilog": {"available": True, "version": "fake"}},
+        "input_hashes": {
+            "candidate_rtl_sha256": "1" * 64,
+            "testbench_sha256": "2" * 64,
+            "support_files": [],
+        },
+        "toolchain": {
+            name: {"available": True, "version": "fake"}
+            for name in ("iverilog", "vvp", "verilator", "yosys")
+        },
         "checks": {
-            "compile": {"candidate": passed},
-            "simulation": {"candidate_passes": passed},
+            "compile": {"candidate": compile_status},
+            "simulation": {"candidate_passes": simulation_status},
             "lint": {"candidate": not_requested},
             "synthesis": {"candidate": not_requested},
         },
         "mismatch_summary": {
             "contract": "mismatch_count_v1",
-            "reported_counts": [0] if accepted else [1],
-            "reported_sample_counts": [1],
-            "maximum_count": 0 if accepted else 1,
-            "timeout_reported": failure_category == "timeout",
+            "reported_counts": reported_counts,
+            "reported_sample_counts": reported_sample_counts,
+            "maximum_count": maximum_count,
+            "timeout_reported": timeout_reported,
         },
         "failure_category": failure_category,
         "accepted": accepted,
@@ -83,6 +142,16 @@ def _fake_podman(tmp_path: Path, *, mode: str) -> tuple[Path, Path]:
     log = tmp_path / f"podman-{mode}.json"
     script = tmp_path / f"podman-{mode}" / "podman"
     script.parent.mkdir()
+    synthetic_categories = {
+        "passing": "passed",
+        "compile_failure": "compile_failure",
+        "functional_mismatch": "functional_mismatch",
+        "timeout": "timeout",
+        "missing_result": "simulation_result_missing",
+        "internal_error": "internal_error",
+        "simulation_failure": "simulation_failure",
+    }
+    synthetic_row = repr(_evidence_for_category(synthetic_categories.get(mode, "passed")))
     body = textwrap.dedent(
         f"""
         #!{sys.executable}
@@ -122,11 +191,10 @@ def _fake_podman(tmp_path: Path, *, mode: str) -> tuple[Path, Path]:
             "timeout": ("timeout", False),
             "missing_result": ("simulation_result_missing", False),
             "internal_error": ("internal_error", False),
+            "simulation_failure": ("simulation_failure", False),
         }}
         category, accepted = categories[{mode!r}]
-        row = {repr(_evidence("passed", True))}
-        row["failure_category"] = category
-        row["accepted"] = accepted
+        row = {synthetic_row}
         (output_root / "candidate_evidence.jsonl").write_text(json.dumps(row, sort_keys=True) + "\\n", encoding="utf-8")
         raise SystemExit(0)
         """
@@ -145,6 +213,7 @@ def _fake_podman(tmp_path: Path, *, mode: str) -> tuple[Path, Path]:
         ("timeout", "timeout", False),
         ("missing_result", "simulation_result_missing", False),
         ("internal_error", "internal_error", False),
+        ("simulation_failure", "simulation_failure", False),
     ],
 )
 def test_synthetic_runner_outcomes_preserve_evidence_and_input(
@@ -175,20 +244,197 @@ def test_synthetic_runner_outcomes_preserve_evidence_and_input(
     rows = runner.validate_candidate_evidence_file(output, max_bytes=1_000_000)
     assert rows[0]["failure_category"] == expected_category
     assert rows[0]["accepted"] is accepted
-    assert json.loads(Path(str(output) + ".runner.json").read_text()) == {
+    sidecar = json.loads(Path(str(output) + ".runner.json").read_text())
+    assert sidecar == {
+        "evidence_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
         "image": IMAGE,
+        "image_digest": "sha256:" + "a" * 64,
         "iverilog_version": LABELS["io.rtlbench.iverilog_version"],
+        "manifest_sha256": hashlib.sha256(
+            (handoff / "candidate_manifest.jsonl").read_bytes()
+        ).hexdigest(),
+        "network_policy": "none",
+        "partial_evidence_sha256": None,
         "python_version": LABELS["io.rtlbench.python_version"],
+        "resource_limits": {
+            "cpus": 2.0,
+            "evidence_bytes": 33554432,
+            "file_size_bytes": 33554432,
+            "memory_bytes": 536870912,
+            "open_files": 256,
+            "pids": 128,
+            "tmp_bytes": 134217728,
+            "wall_seconds": 120.0,
+            "work_bytes": 268435456,
+        },
+        "rootless": True,
         "rtlbench_commit": LABELS["org.opencontainers.image.revision"],
         "runner_config_version": "rtlbench_rootless_runner_v0.1",
         "verilator_version": LABELS["io.rtlbench.verilator_version"],
         "vvp_version": LABELS["io.rtlbench.vvp_version"],
+        "workspace_tree_sha256": runner.sha256_workspace_tree(handoff / "workspace"),
         "yosys_version": LABELS["io.rtlbench.yosys_version"],
     }
     assert _tree_hashes(handoff) == before
     assert not list((tmp_path / "tmp").glob(".rtlbench-runner-*"))
     record = json.loads(log.read_text())
     assert record[-1]["secret_present"] is False
+
+
+def test_wrapper_forwards_every_argument_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    handoff = _make_handoff(tmp_path / "handoff")
+    fake_podman, log = _fake_podman(tmp_path, mode="passing")
+    output = tmp_path / "evidence.jsonl"
+    runner.run_isolated(image=IMAGE, input_root=handoff, output=output, runtime=str(fake_podman))
+    run_argv = json.loads(log.read_text())[-1]["argv"]
+    image_index = run_argv.index(IMAGE)
+    assert run_argv[image_index + 1 :] == list(runner.EXPECTED_INNER_COMMAND[1:])
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda row: row.update(accepted=False),
+        lambda row: row.update(failure_category="compile_failure"),
+        lambda row: row["checks"]["lint"].update(
+            candidate={"attempted": True, "passed": True, "reason": None}
+        ),
+        lambda row: row["checks"]["simulation"]["candidate_passes"].update(
+            passed=False, reason="simulation_failure"
+        ),
+    ],
+)
+def test_contradictory_evidence_is_rejected(tmp_path: Path, mutation):
+    row = copy.deepcopy(_evidence_for_category("passed"))
+    mutation(row)
+    path = tmp_path / "contradictory.jsonl"
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    with pytest.raises(runner.RunnerError):
+        runner.validate_candidate_evidence_file(path, max_bytes=1_000_000)
+
+
+@pytest.mark.parametrize(
+    "category",
+    [
+        "passed",
+        "compile_failure",
+        "functional_mismatch",
+        "timeout",
+        "simulation_result_missing",
+        "simulation_failure",
+        "internal_error",
+    ],
+)
+def test_canonical_valid_evidence_categories_are_accepted(
+    tmp_path: Path, category: str
+):
+    path = tmp_path / f"{category}.jsonl"
+    path.write_text(
+        json.dumps(_evidence_for_category(category)) + "\n", encoding="utf-8"
+    )
+    assert runner.validate_candidate_evidence_file(path, max_bytes=1_000_000)
+
+
+def test_dockerfile_wrapper_and_build_identity_checks_are_explicit():
+    dockerfile = (Path(__file__).parents[1] / "runner" / "Dockerfile").read_text(
+        encoding="utf-8"
+    )
+    assert "'exec python -m rtlbench.cli \"$@\"'" in dockerfile
+    assert "test \"$(sed -n '2p' /usr/local/bin/rtlbench)\"" in dockerfile
+    assert "PYTHONPATH=/opt/rtlbench/src /usr/local/bin/rtlbench --help >/dev/null" in dockerfile
+
+
+def test_built_cli_help_succeeds():
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    result = subprocess.run(
+        [sys.executable, "-S", "-m", "rtlbench.cli", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=environment,
+    )
+    assert result.returncode == 0
+
+
+def test_build_rejects_false_rtlbench_commit_label():
+    command = [
+        "bash",
+        "runner/build_rootless_image.sh",
+        "--base-image",
+        "python:3.11-slim@sha256:" + "a" * 64,
+        "--tag",
+        "localhost/rtlbench-runner:test",
+        "--rtlbench-commit",
+        "1" * 40,
+        "--python-version",
+        "3.11.9",
+        "--iverilog-package-version",
+        "11.0-1.1+b1",
+        "--iverilog-version",
+        "11.0",
+        "--vvp-version",
+        "11.0",
+        "--verilator-package-version",
+        "5.006-3",
+        "--verilator-version",
+        "Verilator 5.006",
+        "--yosys-package-version",
+        "0.23-6",
+        "--yosys-version",
+        "Yosys 0.23",
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    assert result.returncode != 0
+    assert "does not match the checked-out source HEAD" in result.stderr
+
+
+def test_build_rejects_false_tool_version_labels():
+    expected = build_identity.ExpectedIdentity(
+        python_version="3.11.9",
+        iverilog_package_version="11.0-1.1+b1",
+        iverilog_version="11.0",
+        vvp_version="11.0",
+        verilator_package_version="5.006-3",
+        verilator_version="Verilator 5.006",
+        yosys_package_version="0.23-6",
+        yosys_version="Yosys 0.23",
+    )
+    packages = {
+        "iverilog": "11.0-1.1+b1",
+        "verilator": "5.006-3",
+        "yosys": "0.23-6",
+    }
+    tools = {
+        "iverilog": "Icarus Verilog version 11.0",
+        "vvp": "vvp 11.0",
+        "verilator": "Verilator 5.006",
+        "yosys": "Yosys 0.23",
+    }
+    with pytest.raises(build_identity.BuildIdentityError, match="yosys runtime"):
+        build_identity.validate_identity(
+            expected,
+            python_version="3.11.9",
+            package_versions=packages,
+            tool_outputs={**tools, "yosys": "Yosys 0.22"},
+        )
+    with pytest.raises(build_identity.BuildIdentityError, match="verilator package"):
+        build_identity.validate_identity(
+            expected,
+            python_version="3.11.9",
+            package_versions={**packages, "verilator": "5.005-1"},
+            tool_outputs=tools,
+        )
+
+
+def test_readme_requires_output_outside_input_handoff():
+    readme = (Path(__file__).parents[1] / "runner" / "README.md").read_text(
+        encoding="utf-8"
+    )
+    assert "--output /path/to/isolated-output/candidate_evidence.jsonl" in readme
+    assert "--output /path/to/attempt_01/candidate_evidence.jsonl" not in readme
 
 
 def test_runner_applies_security_boundary_and_no_reference_rtl(tmp_path: Path):

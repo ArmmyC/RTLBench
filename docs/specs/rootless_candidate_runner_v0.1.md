@@ -27,7 +27,10 @@ The launcher rejects mutable image references and missing or inconsistent
 identity labels. The runner configuration is
 `rtlbench_rootless_runner_v0.1`. It writes the immutable identity beside the
 evidence as `candidate_evidence.jsonl.runner.json`; the record contains no
-timestamp, username, hostname, or host path.
+timestamp, username, hostname, or host path. The build wrapper verifies that
+the requested RTLBench commit matches a clean checkout. The image build also
+checks the actual Python interpreter, installed Debian package versions, and
+reported executable versions before labels are published.
 
 ## Runtime boundary
 
@@ -68,12 +71,17 @@ rtlbench verify-candidates \
 The launcher rejects symlinks and special files in the input handoff and
 rejects any `reference.sv`. It accepts only the final evidence file and the
 verifier-managed `.rtlbench-partial` in the output staging directory. Final
-JSONL is validated against `rtl_candidate_evidence_v0.1` before an atomic host
-publication. Compile failures, functional mismatches, timeout rows, missing
-mismatch results, and candidate-level internal-error rows are valid evidence
-and remain preserved. A container or wall-clock failure with only partial
-evidence publishes that partial beside the requested output and returns
-non-zero.
+JSONL is validated against `rtl_candidate_evidence_v0.1` by one strict
+canonical validator before an atomic host publication. The validator enforces
+accepted/check/category relationships, failure-category priority,
+requested-check state, mismatch contracts, timeout evidence, and exact
+SHA-256 input-hash records. Compile failures, functional mismatches, timeout
+rows, missing mismatch results, and candidate-level internal-error rows are
+valid evidence and remain preserved. A container or wall-clock failure with
+only partial evidence publishes that partial beside the requested output and
+returns non-zero. The identity sidecar binds publication to the manifest
+hash, deterministic workspace-tree hash, final evidence hash, image digest,
+and fixed runtime/resource policies.
 
 ## Acceptance
 

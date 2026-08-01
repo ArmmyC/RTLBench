@@ -10,14 +10,26 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
+SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src"
+if str(SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SOURCE_ROOT))
+
+from rtlbench.candidate_evidence import (  # noqa: E402
+    CandidateEvidenceValidationError,
+    sha256_file,
+    sha256_workspace_tree,
+    validate_candidate_evidence_file as _validate_candidate_evidence_file,
+)
+
+
 CONFIG_PATH = Path(__file__).with_name("runner_config.json")
-EVIDENCE_SCHEMA_VERSION = "rtl_candidate_evidence_v0.1"
 IMAGE_DIGEST_RE = re.compile(r"^.+@sha256:[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 EXPECTED_INNER_COMMAND = (
@@ -33,43 +45,6 @@ EXPECTED_INNER_COMMAND = (
     "/work",
     "--force",
 )
-EVIDENCE_FIELDS = {
-    "schema_version",
-    "candidate_id",
-    "task_id",
-    "source_id",
-    "attempt",
-    "top_module",
-    "testbench_top",
-    "simulation_result_contract",
-    "requested_checks",
-    "input_hashes",
-    "toolchain",
-    "checks",
-    "mismatch_summary",
-    "failure_category",
-    "accepted",
-    "diagnostics",
-}
-CHECK_FIELDS = {"compile", "simulation", "lint", "synthesis"}
-FAILURE_CATEGORIES = {
-    "passed",
-    "tool_unavailable",
-    "compile_failure",
-    "functional_mismatch",
-    "simulation_result_missing",
-    "simulation_failure",
-    "timeout",
-    "internal_error",
-    "partial_failure",
-}
-MISMATCH_FIELDS = {
-    "contract",
-    "reported_counts",
-    "reported_sample_counts",
-    "maximum_count",
-    "timeout_reported",
-}
 IDENTITY_LABELS = {
     "rtlbench_commit": "org.opencontainers.image.revision",
     "runner_config_version": "io.rtlbench.runner.config_version",
@@ -250,6 +225,31 @@ def run_isolated(
     output = _validate_host_output(output, input_root, config, force_output)
     _validate_no_reference_rtl(input_root)
     identity = _read_image_identity(runtime_path, image, config)
+    manifest_path = input_root / "candidate_manifest.jsonl"
+    workspace_path = input_root / "workspace"
+    manifest_sha256 = sha256_file(manifest_path)
+    workspace_tree_sha256 = sha256_workspace_tree(workspace_path)
+    identity.update(
+        {
+            "rootless": True,
+            "network_policy": "none",
+            "resource_limits": {
+                "cpus": config.cpus,
+                "memory_bytes": config.memory_bytes,
+                "pids": config.pids,
+                "file_size_bytes": config.file_size_bytes,
+                "open_files": config.open_files,
+                "work_bytes": config.work_bytes,
+                "tmp_bytes": config.tmp_bytes,
+                "wall_seconds": config.wall_seconds,
+                "evidence_bytes": config.evidence_bytes,
+            },
+            "manifest_sha256": manifest_sha256,
+            "workspace_tree_sha256": workspace_tree_sha256,
+            "evidence_sha256": None,
+            "partial_evidence_sha256": None,
+        }
+    )
     timeout = config.wall_seconds if wall_timeout is None else wall_timeout
     if timeout <= 0:
         raise RunnerError("wall timeout must be greater than zero")
@@ -277,6 +277,10 @@ def run_isolated(
                 raise RunnerError(
                     f"isolated RTLBench exited with status {returncode} without evidence"
                 )
+            if sha256_file(manifest_path) != manifest_sha256:
+                raise RunnerError("input manifest changed during isolated execution")
+            if sha256_workspace_tree(workspace_path) != workspace_tree_sha256:
+                raise RunnerError("input workspace changed during isolated execution")
             if output.exists() and not force_output:
                 raise RunnerError(f"output already exists: {output}")
             partial_destination = Path(str(output) + ".rtlbench-partial")
@@ -287,8 +291,10 @@ def run_isolated(
                 raise RunnerError("managed runner output already exists; use --force-output")
             if final_exists:
                 _publish_file(final, output, max_bytes=config.evidence_bytes)
+                identity["evidence_sha256"] = sha256_file(output)
             if partial_exists:
                 _publish_file(partial, partial_destination, max_bytes=config.evidence_bytes)
+                identity["partial_evidence_sha256"] = sha256_file(partial_destination)
             _publish_json(identity_destination, identity)
             result = RunResult(
                 returncode=124 if timed_out else returncode,
@@ -301,100 +307,10 @@ def run_isolated(
 
 
 def validate_candidate_evidence_file(path: Path, *, max_bytes: int) -> list[dict[str, Any]]:
-    if not path.is_file() or path.is_symlink():
-        raise RunnerError("candidate evidence must be a regular non-symlink file")
-    if path.stat().st_size > max_bytes:
-        raise RunnerError("candidate evidence exceeds the configured size limit")
-    rows: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            for line_number, raw in enumerate(handle, 1):
-                if not raw.strip():
-                    continue
-                try:
-                    row = json.loads(raw)
-                except json.JSONDecodeError as exc:
-                    raise RunnerError(f"evidence line {line_number}: malformed JSON") from exc
-                _validate_evidence_row(row, line_number)
-                candidate_id = row["candidate_id"]
-                if candidate_id in seen_ids:
-                    raise RunnerError(f"evidence line {line_number}: duplicate candidate_id")
-                seen_ids.add(candidate_id)
-                rows.append(row)
-    except UnicodeDecodeError as exc:
-        raise RunnerError("candidate evidence is not valid UTF-8") from exc
-    if not rows:
-        raise RunnerError("candidate evidence contains no rows")
-    return rows
-
-
-def _validate_evidence_row(row: Any, line_number: int) -> None:
-    if not isinstance(row, dict) or set(row) != EVIDENCE_FIELDS:
-        raise RunnerError(f"evidence line {line_number}: top-level schema mismatch")
-    if row["schema_version"] != EVIDENCE_SCHEMA_VERSION:
-        raise RunnerError(f"evidence line {line_number}: unsupported schema_version")
-    for key in ("candidate_id", "task_id", "source_id", "top_module", "testbench_top"):
-        if not isinstance(row[key], str) or not row[key]:
-            raise RunnerError(f"evidence line {line_number}: invalid {key}")
-    if type(row["attempt"]) is not int or row["attempt"] < 1:
-        raise RunnerError(f"evidence line {line_number}: invalid attempt")
-    if row["simulation_result_contract"] not in {"mismatch_count_v1", "exit_code_v1"}:
-        raise RunnerError(f"evidence line {line_number}: invalid simulation contract")
-    checks = row["checks"]
-    if not isinstance(checks, dict) or set(checks) != CHECK_FIELDS:
-        raise RunnerError(f"evidence line {line_number}: invalid checks")
-    for check_name, leaf_name in (
-        ("compile", "candidate"),
-        ("simulation", "candidate_passes"),
-        ("lint", "candidate"),
-        ("synthesis", "candidate"),
-    ):
-        container = checks[check_name]
-        if not isinstance(container, dict) or set(container) != {leaf_name}:
-            raise RunnerError(f"evidence line {line_number}: invalid {check_name} check")
-        leaf = container[leaf_name]
-        if not isinstance(leaf, dict) or set(leaf) != {"attempted", "passed", "reason"}:
-            raise RunnerError(f"evidence line {line_number}: invalid {check_name} leaf")
-        if type(leaf["attempted"]) is not bool or type(leaf["passed"]) not in {bool, type(None)}:
-            raise RunnerError(f"evidence line {line_number}: invalid {check_name} status")
-        if leaf["reason"] is not None and not isinstance(leaf["reason"], str):
-            raise RunnerError(f"evidence line {line_number}: invalid {check_name} reason")
-    requested = row["requested_checks"]
-    if (
-        not isinstance(requested, dict)
-        or set(requested) != {"compile", "simulation", "lint", "synthesis"}
-        or any(type(value) is not bool for value in requested.values())
-    ):
-        raise RunnerError(f"evidence line {line_number}: invalid requested_checks")
-    mismatch = row["mismatch_summary"]
-    if not isinstance(mismatch, dict) or set(mismatch) != MISMATCH_FIELDS:
-        raise RunnerError(f"evidence line {line_number}: invalid mismatch_summary")
-    if (
-        mismatch["contract"] not in {"mismatch_count_v1", "exit_code_v1"}
-        or not isinstance(mismatch["reported_counts"], list)
-        or not isinstance(mismatch["reported_sample_counts"], list)
-        or any(type(value) is not int or value < 0 for value in mismatch["reported_counts"])
-        or any(
-            value is not None
-            and (type(value) is not int or value < 0)
-            for value in mismatch["reported_sample_counts"]
-        )
-        or (
-            mismatch["maximum_count"] is not None
-            and (type(mismatch["maximum_count"]) is not int or mismatch["maximum_count"] < 0)
-        )
-        or type(mismatch["timeout_reported"]) is not bool
-    ):
-        raise RunnerError(f"evidence line {line_number}: invalid mismatch_summary values")
-    if row["failure_category"] not in FAILURE_CATEGORIES:
-        raise RunnerError(f"evidence line {line_number}: invalid failure_category")
-    if type(row["accepted"]) is not bool or not isinstance(row["diagnostics"], list):
-        raise RunnerError(f"evidence line {line_number}: invalid result fields")
-    if any(not isinstance(item, str) for item in row["diagnostics"]):
-        raise RunnerError(f"evidence line {line_number}: invalid diagnostics")
-    if not isinstance(row["input_hashes"], dict) or not isinstance(row["toolchain"], dict):
-        raise RunnerError(f"evidence line {line_number}: invalid evidence metadata")
+        return _validate_candidate_evidence_file(path, max_bytes=max_bytes)
+    except CandidateEvidenceValidationError as exc:
+        raise RunnerError(str(exc)) from exc
 
 
 def _validate_runtime(runtime: str, config: RunnerConfig) -> str:
@@ -474,7 +390,7 @@ def _validate_host_output(
     return resolved
 
 
-def _read_image_identity(runtime: str, image: str, config: RunnerConfig) -> dict[str, str]:
+def _read_image_identity(runtime: str, image: str, config: RunnerConfig) -> dict[str, Any]:
     result = _run_checked(
         [runtime, "image", "inspect", "--format", "{{json .Config.Labels}}", image],
         timeout=10.0,
@@ -488,7 +404,11 @@ def _read_image_identity(runtime: str, image: str, config: RunnerConfig) -> dict
         raise RunnerError("RTLBench image labels are not valid JSON") from exc
     if not isinstance(labels, dict):
         raise RunnerError("RTLBench image labels are missing")
-    identity: dict[str, str] = {"runner_config_version": config.version, "image": image}
+    identity: dict[str, Any] = {
+        "runner_config_version": config.version,
+        "image": image,
+        "image_digest": image.split("@", 1)[1],
+    }
     for identity_name, label_name in IDENTITY_LABELS.items():
         value = labels.get(label_name)
         if not isinstance(value, str) or not value:
@@ -608,7 +528,7 @@ def _publish_file(source: Path, destination: Path, *, max_bytes: int) -> None:
     os.replace(temporary, destination)
 
 
-def _publish_json(destination: Path, value: Mapping[str, str]) -> None:
+def _publish_json(destination: Path, value: Mapping[str, Any]) -> None:
     temporary = destination.with_name(f".{destination.name}.runner-partial")
     if temporary.exists() or temporary.is_symlink():
         temporary.unlink()
