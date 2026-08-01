@@ -139,8 +139,18 @@ def _tree_hashes(root: Path) -> dict[str, str]:
 
 
 def _fake_podman(tmp_path: Path, *, mode: str) -> tuple[Path, Path]:
-    log = tmp_path / f"podman-{mode}.json"
-    script = tmp_path / f"podman-{mode}" / "podman"
+    return _fake_runtime(tmp_path, mode=mode, backend="podman")
+
+
+def _fake_docker(tmp_path: Path, *, mode: str = "passing") -> tuple[Path, Path]:
+    return _fake_runtime(tmp_path, mode=mode, backend="docker")
+
+
+def _fake_runtime(
+    tmp_path: Path, *, mode: str, backend: str
+) -> tuple[Path, Path]:
+    log = tmp_path / f"{backend}-{mode}.json"
+    script = tmp_path / f"{backend}-{mode}" / backend
     script.parent.mkdir()
     synthetic_categories = {
         "passing": "passed",
@@ -165,8 +175,11 @@ def _fake_podman(tmp_path: Path, *, mode: str) -> tuple[Path, Path]:
         record = json.loads(log.read_text()) if log.exists() else []
         record.append({{"argv": args, "secret_present": "FAKE_HOST_SECRET" in os.environ}})
         log.write_text(json.dumps(record), encoding="utf-8")
-        if args[:1] == ["info"]:
+        if {backend!r} == "podman" and args[:1] == ["info"]:
             print("true")
+            raise SystemExit(0)
+        if {backend!r} == "docker" and args[:2] == ["version", "--format"]:
+            print(json.dumps("26.1.0"))
             raise SystemExit(0)
         if args[:2] == ["image", "inspect"]:
             print(json.dumps({LABELS!r}))
@@ -176,6 +189,12 @@ def _fake_podman(tmp_path: Path, *, mode: str) -> tuple[Path, Path]:
         mounts = [args[index + 1] for index, value in enumerate(args[:-1]) if value == "--mount"]
         output_mount = next(value for value in mounts if "dst=/output" in value)
         output_root = Path(next(part[4:] for part in output_mount.split(",") if part.startswith("src=")))
+        input_mount = next(value for value in mounts if "dst=/input" in value)
+        input_root = Path(next(part[4:] for part in input_mount.split(",") if part.startswith("src=")))
+        if {mode!r} == "mutate":
+            (input_root / "candidate_manifest.jsonl").write_text(
+                "mutated by fake runtime\\n", encoding="utf-8"
+            )
         if {mode!r} == "partial":
             (output_root / "candidate_evidence.jsonl.rtlbench-partial").write_text("partial row\\n", encoding="utf-8")
             raise SystemExit(124)
@@ -192,6 +211,7 @@ def _fake_podman(tmp_path: Path, *, mode: str) -> tuple[Path, Path]:
             "missing_result": ("simulation_result_missing", False),
             "internal_error": ("internal_error", False),
             "simulation_failure": ("simulation_failure", False),
+            "mutate": ("passed", True),
         }}
         category, accepted = categories[{mode!r}]
         row = {synthetic_row}
@@ -216,16 +236,30 @@ def _fake_podman(tmp_path: Path, *, mode: str) -> tuple[Path, Path]:
         ("simulation_failure", "simulation_failure", False),
     ],
 )
+@pytest.mark.parametrize(
+    ("profile", "backend", "acknowledge"),
+    [
+        (runner.PROFILE_PRODUCTION_ROOTLESS, "podman", False),
+        (runner.PROFILE_PILOT_DOCKER, "docker", True),
+    ],
+)
 def test_synthetic_runner_outcomes_preserve_evidence_and_input(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     mode: str,
     expected_category: str,
     accepted: bool,
+    profile: str,
+    backend: str,
+    acknowledge: bool,
 ):
     handoff = _make_handoff(tmp_path / "handoff")
     before = _tree_hashes(handoff)
-    fake_podman, log = _fake_podman(tmp_path, mode=mode)
+    fake_runtime, log = (
+        _fake_podman(tmp_path, mode=mode)
+        if backend == "podman"
+        else _fake_docker(tmp_path, mode=mode)
+    )
     output = tmp_path / "evidence" / "candidate_evidence.jsonl"
     output.parent.mkdir()
     monkeypatch.setenv("FAKE_HOST_SECRET", "must-not-cross-boundary")
@@ -237,7 +271,9 @@ def test_synthetic_runner_outcomes_preserve_evidence_and_input(
         image=IMAGE,
         input_root=handoff,
         output=output,
-        runtime=str(fake_podman),
+        profile=profile,
+        acknowledge_rootful_runtime=acknowledge,
+        runtime=str(fake_runtime),
     )
 
     assert result.returncode == 0
@@ -245,7 +281,12 @@ def test_synthetic_runner_outcomes_preserve_evidence_and_input(
     assert rows[0]["failure_category"] == expected_category
     assert rows[0]["accepted"] is accepted
     sidecar = json.loads(Path(str(output) + ".runner.json").read_text())
+    config = runner.load_config(profile=profile)
     assert sidecar == {
+        "schema_version": runner.IDENTITY_SCHEMA_VERSION,
+        "profile": profile,
+        "runtime": config.runtime_name,
+        "runtime_mode": config.runtime_mode,
         "evidence_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
         "image": IMAGE,
         "image_digest": "sha256:" + "a" * 64,
@@ -257,17 +298,18 @@ def test_synthetic_runner_outcomes_preserve_evidence_and_input(
         "partial_evidence_sha256": None,
         "python_version": LABELS["io.rtlbench.python_version"],
         "resource_limits": {
-            "cpus": 2.0,
+            "cpus": config.cpus,
             "evidence_bytes": 33554432,
             "file_size_bytes": 33554432,
             "memory_bytes": 536870912,
+            "memory_swap_bytes": config.memory_swap_bytes,
             "open_files": 256,
-            "pids": 128,
-            "tmp_bytes": 134217728,
+            "pids": config.pids,
+            "tmp_bytes": config.tmp_bytes,
             "wall_seconds": 120.0,
-            "work_bytes": 268435456,
+            "work_bytes": config.work_bytes,
         },
-        "rootless": True,
+        "rootless": config.rootless,
         "rtlbench_commit": LABELS["org.opencontainers.image.revision"],
         "runner_config_version": "rtlbench_rootless_runner_v0.1",
         "verilator_version": LABELS["io.rtlbench.verilator_version"],
@@ -291,6 +333,153 @@ def test_wrapper_forwards_every_argument_unchanged(
     run_argv = json.loads(log.read_text())[-1]["argv"]
     image_index = run_argv.index(IMAGE)
     assert run_argv[image_index + 1 :] == list(runner.EXPECTED_INNER_COMMAND[1:])
+
+
+def test_primary_cli_requires_an_explicit_profile():
+    parser = runner._build_parser(require_profile=True)
+    required = [
+        "--image",
+        IMAGE,
+        "--input",
+        "/input",
+        "--output",
+        "/output/evidence.jsonl",
+    ]
+    with pytest.raises(SystemExit):
+        parser.parse_args(required)
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--profile", "automatic", *required])
+
+
+def test_primary_cli_help_succeeds():
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).parents[1] / "runner" / "run_isolated.py"), "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert "--profile" in result.stdout
+
+
+def test_profile_selection_requires_acknowledgement_and_fixed_backend(
+    tmp_path: Path,
+):
+    handoff = _make_handoff(tmp_path / "handoff")
+    fake_docker, docker_log = _fake_docker(tmp_path)
+    with pytest.raises(runner.RunnerError, match="acknowledge-rootful-runtime"):
+        runner.run_isolated(
+            image=IMAGE,
+            input_root=handoff,
+            output=tmp_path / "docker-evidence.jsonl",
+            profile=runner.PROFILE_PILOT_DOCKER,
+            runtime=str(fake_docker),
+        )
+    assert not docker_log.exists()
+
+    fake_podman, podman_log = _fake_podman(tmp_path, mode="passing")
+    with pytest.raises(runner.RunnerError, match="only valid with pilot-docker"):
+        runner.run_isolated(
+            image=IMAGE,
+            input_root=handoff,
+            output=tmp_path / "rootless-evidence.jsonl",
+            profile=runner.PROFILE_PRODUCTION_ROOTLESS,
+            acknowledge_rootful_runtime=True,
+            runtime=str(fake_podman),
+        )
+    assert not podman_log.exists()
+
+    with pytest.raises(runner.RunnerError, match="requires the docker runtime"):
+        runner.run_isolated(
+            image=IMAGE,
+            input_root=handoff,
+            output=tmp_path / "wrong-docker-evidence.jsonl",
+            profile=runner.PROFILE_PILOT_DOCKER,
+            acknowledge_rootful_runtime=True,
+            runtime=str(fake_podman),
+        )
+    with pytest.raises(runner.RunnerError, match="requires the podman runtime"):
+        runner.run_isolated(
+            image=IMAGE,
+            input_root=handoff,
+            output=tmp_path / "wrong-podman-evidence.jsonl",
+            profile=runner.PROFILE_PRODUCTION_ROOTLESS,
+            runtime=str(fake_docker),
+        )
+
+
+def test_docker_pilot_command_is_fixed_and_bounded(tmp_path: Path):
+    config = runner.load_config(profile=runner.PROFILE_PILOT_DOCKER)
+    command = runner.build_run_command(
+        "/usr/bin/docker",
+        IMAGE,
+        tmp_path / "input",
+        tmp_path / "output",
+        config,
+    )
+
+    def value(option: str) -> str:
+        return command[command.index(option) + 1]
+
+    assert value("--network") == "none"
+    assert value("--user") == "65532:65532"
+    assert "--read-only" in command
+    assert value("--cap-drop") == "ALL"
+    assert value("--security-opt") == "no-new-privileges"
+    assert value("--cpus") == "1"
+    assert value("--memory") == "536870912"
+    assert value("--memory-swap") == "536870912"
+    assert value("--pids-limit") == "64"
+    assert "fsize=33554432:33554432" in command
+    assert "nofile=256:256" in command
+    assert "nproc=64:64" in command
+    assert "/tmp:rw,nosuid,nodev,noexec,size=67108864,mode=1777" in command
+    assert "/work:rw,nosuid,nodev,size=134217728,uid=65532,gid=65532,mode=700" in command
+    mounts = [
+        command[index + 1]
+        for index, item in enumerate(command[:-1])
+        if item == "--mount"
+    ]
+    assert any("dst=/input,readonly" in mount for mount in mounts)
+    assert any("dst=/output,rw" in mount for mount in mounts)
+    assert command[command.index(IMAGE) + 1 :] == list(runner.EXPECTED_INNER_COMMAND[1:])
+    assert "--userns" not in command
+    forbidden = {
+        "--privileged",
+        "--network=host",
+        "/var/run/docker.sock",
+        "--env-file",
+        "--pid",
+        "host",
+        "--ipc",
+        "--device",
+        "--volumes-from",
+    }
+    assert not forbidden.intersection(command)
+
+
+@pytest.mark.parametrize(
+    ("profile", "backend", "acknowledge"),
+    [
+        (runner.PROFILE_PRODUCTION_ROOTLESS, "podman", False),
+        (runner.PROFILE_PILOT_DOCKER, "docker", True),
+    ],
+)
+def test_input_mutation_is_rejected_for_both_profiles(
+    tmp_path: Path, profile: str, backend: str, acknowledge: bool
+):
+    handoff = _make_handoff(tmp_path / "handoff")
+    fake_runtime, _ = _fake_runtime(tmp_path, mode="mutate", backend=backend)
+    with pytest.raises(runner.RunnerError, match="input manifest changed"):
+        runner.run_isolated(
+            image=IMAGE,
+            input_root=handoff,
+            output=tmp_path / "evidence.jsonl",
+            profile=profile,
+            acknowledge_rootful_runtime=acknowledge,
+            runtime=str(fake_runtime),
+        )
+    assert not (tmp_path / "evidence.jsonl").exists()
 
 
 @pytest.mark.parametrize(
@@ -909,5 +1098,96 @@ def test_rootless_image_acceptance_matrix(tmp_path: Path):
     assert {row["failure_category"] for row in evidence} == {
         expected for _, expected in directories
     }
+    assert _tree_hashes(handoff) == before
+    assert not any(path.name == "reference.sv" for path in handoff.rglob("*"))
+
+
+@pytest.mark.integration
+def test_docker_pilot_image_acceptance_matrix(tmp_path: Path):
+    """Run the real sequential Docker pilot matrix only when explicitly selected."""
+
+    image = os.environ.get("RTLBench_DOCKER_RUNNER_IMAGE")
+    if not image:
+        pytest.skip(
+            "set RTLBench_DOCKER_RUNNER_IMAGE to run the Docker pilot acceptance matrix"
+        )
+    if shutil.which("docker") is None:
+        pytest.fail("Docker is required when RTLBench_DOCKER_RUNNER_IMAGE is set")
+    docker_result = subprocess.run(
+        ["docker", "version", "--format", "{{json .Server.Version}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if docker_result.returncode != 0:
+        pytest.fail("Docker is unavailable when RTLBench_DOCKER_RUNNER_IMAGE is set")
+
+    fixture_root = Path(__file__).parent / "fixtures" / "candidate_verification"
+    handoff = tmp_path / "handoff"
+    workspace = handoff / "workspace"
+    workspace.mkdir(parents=True)
+    rows = []
+    directories = (
+        ("passing", "passed"),
+        ("compile_failure", "compile_failure"),
+        ("functional_mismatch", "functional_mismatch"),
+        ("timeout_marker", "timeout"),
+        ("missing_result", "simulation_result_missing"),
+    )
+    for directory, _ in directories:
+        shutil.copytree(fixture_root / directory, workspace / directory)
+        rows.append(
+            {
+                "schema_version": "rtl_candidate_manifest_v0.1",
+                "candidate_id": f"synthetic_{directory}_attempt_01",
+                "task_id": f"synthetic_{directory}",
+                "source_id": directory,
+                "attempt": 1,
+                "top_module": "TopModule",
+                "testbench_top": "tb",
+                "candidate_rtl_path": f"{directory}/candidate.sv",
+                "testbench_path": f"{directory}/testbench.sv",
+                "support_files": [],
+                "simulation_result_contract": "mismatch_count_v1",
+                "requested_checks": {
+                    "compile": True,
+                    "simulation": True,
+                    "lint": False,
+                    "synthesis": False,
+                },
+            }
+        )
+    (handoff / "candidate_manifest.jsonl").write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    before = _tree_hashes(handoff)
+    output = tmp_path / "isolated-output" / "candidate_evidence.jsonl"
+    output.parent.mkdir()
+    result = runner.run_isolated(
+        image=image,
+        input_root=handoff,
+        output=output,
+        profile=runner.PROFILE_PILOT_DOCKER,
+        acknowledge_rootful_runtime=True,
+    )
+    assert result.returncode == 0
+    evidence = runner.validate_candidate_evidence_file(output, max_bytes=1_000_000)
+    assert {row["failure_category"] for row in evidence} == {
+        expected for _, expected in directories
+    }
+    sidecar = json.loads(Path(str(output) + ".runner.json").read_text())
+    assert sidecar["profile"] == runner.PROFILE_PILOT_DOCKER
+    assert sidecar["runtime"] == "docker"
+    assert sidecar["runtime_mode"] == "rootful-daemon"
+    assert sidecar["rootless"] is False
+    assert sidecar["network_policy"] == "none"
+    assert sidecar["manifest_sha256"] == hashlib.sha256(
+        (handoff / "candidate_manifest.jsonl").read_bytes()
+    ).hexdigest()
+    assert sidecar["workspace_tree_sha256"] == runner.sha256_workspace_tree(
+        handoff / "workspace"
+    )
+    assert sidecar["evidence_sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
     assert _tree_hashes(handoff) == before
     assert not any(path.name == "reference.sv" for path in handoff.rglob("*"))

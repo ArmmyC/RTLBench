@@ -129,15 +129,20 @@ production secrets, and apply CPU, memory, process, output, disk, and time
 limits externally. This command does not implement a universal sandbox, so
 host execution must not be considered safe merely because paths are validated.
 
-The repository includes a rootless Podman launcher for this boundary under
-`runner/`. It requires an immutable digest-qualified image with labels for the
-RTLBench commit, Python, Icarus/`vvp`, Verilator, Yosys, and runner config
-versions. The launcher mounts the handoff read-only at `/input`, evidence at
-`/output`, and bounded scratch at `/work` and `/tmp`; it drops capabilities,
-disables networking, uses a non-root user, and applies external resource
-limits. It preserves final or managed partial evidence and writes a
-timestamp-free runner identity sidecar. See [`runner/README.md`](runner/README.md)
-and [`docs/specs/rootless_candidate_runner_v0.1.md`](docs/specs/rootless_candidate_runner_v0.1.md).
+The repository includes an explicit-profile launcher under `runner/`. Use
+`production-rootless` with rootless Podman for shared or production systems;
+it requires an immutable digest-qualified image and a successful
+`podman ... Rootless` check. For a small sequential local pilot, select
+`pilot-docker` and pass `--acknowledge-rootful-runtime` explicitly. That mode
+uses rootful Docker as a weaker trust boundary and is never selected as a
+fallback. Both modes mount the handoff read-only at `/input`, evidence at
+`/output`, and bounded scratch at `/work` and `/tmp`; they drop capabilities,
+disable networking, use a non-root user, apply external resource limits, and
+share strict evidence validation and deterministic identity sidecars. The
+Docker pilot defaults are sized for an 8 GB machine, but its 512 MiB container
+limit is not the total host-memory requirement. See
+[`runner/README.md`](runner/README.md) and
+[`docs/specs/rootless_candidate_runner_v0.1.md`](docs/specs/rootless_candidate_runner_v0.1.md).
 
 ### Verify mutation artifacts
 

@@ -18,6 +18,7 @@
   "limits": {
     "cpus": 2.0,
     "memory_bytes": 536870912,
+    "memory_swap_bytes": 536870912,
     "pids": 128,
     "file_size_bytes": 33554432,
     "open_files": 256,
@@ -25,6 +26,44 @@
     "tmp_bytes": 134217728,
     "wall_seconds": 120.0,
     "evidence_bytes": 33554432
+  },
+  "profiles": {
+    "production-rootless": {
+      "runtime": "podman-rootless",
+      "runtime_name": "podman",
+      "runtime_mode": "rootless",
+      "rootless": true,
+      "limits": {
+        "cpus": 2.0,
+        "memory_bytes": 536870912,
+        "memory_swap_bytes": 536870912,
+        "pids": 128,
+        "file_size_bytes": 33554432,
+        "open_files": 256,
+        "work_bytes": 268435456,
+        "tmp_bytes": 134217728,
+        "wall_seconds": 120.0,
+        "evidence_bytes": 33554432
+      }
+    },
+    "pilot-docker": {
+      "runtime": "docker",
+      "runtime_name": "docker",
+      "runtime_mode": "rootful-daemon",
+      "rootless": false,
+      "limits": {
+        "cpus": 1.0,
+        "memory_bytes": 536870912,
+        "memory_swap_bytes": 536870912,
+        "pids": 64,
+        "file_size_bytes": 33554432,
+        "open_files": 256,
+        "work_bytes": 134217728,
+        "tmp_bytes": 67108864,
+        "wall_seconds": 120.0,
+        "evidence_bytes": 33554432
+      }
+    }
   },
   "allowed_output_names": [
     "candidate_evidence.jsonl",

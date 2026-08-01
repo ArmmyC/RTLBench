@@ -30,6 +30,36 @@ from rtlbench.candidate_evidence import (  # noqa: E402
 
 
 CONFIG_PATH = Path(__file__).with_name("runner_config.json")
+PROFILE_PILOT_DOCKER = "pilot-docker"
+PROFILE_PRODUCTION_ROOTLESS = "production-rootless"
+PROFILES = frozenset({PROFILE_PILOT_DOCKER, PROFILE_PRODUCTION_ROOTLESS})
+IDENTITY_SCHEMA_VERSION = "rtlbench_runner_identity_v0.1"
+EXPECTED_PROFILE_LIMITS = {
+    PROFILE_PRODUCTION_ROOTLESS: {
+        "cpus": 2.0,
+        "memory_bytes": 536870912,
+        "memory_swap_bytes": 536870912,
+        "pids": 128,
+        "file_size_bytes": 33554432,
+        "open_files": 256,
+        "work_bytes": 268435456,
+        "tmp_bytes": 134217728,
+        "wall_seconds": 120.0,
+        "evidence_bytes": 33554432,
+    },
+    PROFILE_PILOT_DOCKER: {
+        "cpus": 1.0,
+        "memory_bytes": 536870912,
+        "memory_swap_bytes": 536870912,
+        "pids": 64,
+        "file_size_bytes": 33554432,
+        "open_files": 256,
+        "work_bytes": 134217728,
+        "tmp_bytes": 67108864,
+        "wall_seconds": 120.0,
+        "evidence_bytes": 33554432,
+    },
+}
 IMAGE_DIGEST_RE = re.compile(r"^.+@sha256:[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 EXPECTED_INNER_COMMAND = (
@@ -62,12 +92,17 @@ class RunnerError(RuntimeError):
 
 @dataclass(frozen=True)
 class RunnerConfig:
+    profile: str
     version: str
     runtime: str
+    runtime_name: str
+    runtime_mode: str
+    rootless: bool
     runtime_user: str
     inner_command: tuple[str, ...]
     cpus: float
     memory_bytes: int
+    memory_swap_bytes: int
     pids: int
     file_size_bytes: int
     open_files: int
@@ -87,22 +122,42 @@ class RunResult:
     timed_out: bool
 
 
-def load_config(path: Path = CONFIG_PATH) -> RunnerConfig:
+def load_config(
+    path: Path = CONFIG_PATH, profile: str = PROFILE_PRODUCTION_ROOTLESS
+) -> RunnerConfig:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RunnerError(f"could not read runner configuration: {exc}") from exc
     try:
-        limits = value["limits"]
+        if profile not in PROFILES:
+            raise ValueError(f"unknown isolation profile: {profile}")
+        profile_values = value.get("profiles", {}).get(profile)
+        if profile_values is None:
+            if profile != PROFILE_PRODUCTION_ROOTLESS:
+                raise ValueError(f"runner configuration has no profile: {profile}")
+            profile_values = {
+                "runtime": value["runtime"],
+                "runtime_name": "podman",
+                "runtime_mode": "rootless",
+                "rootless": True,
+                "limits": value["limits"],
+            }
+        limits = profile_values["limits"]
         config = RunnerConfig(
+            profile=profile,
             version=_string(value["runner_config_version"], "runner_config_version"),
-            runtime=_string(value["runtime"], "runtime"),
+            runtime=_string(profile_values["runtime"], "runtime"),
+            runtime_name=_string(profile_values["runtime_name"], "runtime_name"),
+            runtime_mode=_string(profile_values["runtime_mode"], "runtime_mode"),
+            rootless=profile_values["rootless"],
             runtime_user=_string(value["runtime_user"], "runtime_user"),
             inner_command=tuple(
                 _string(item, "inner_command item") for item in value["inner_command"]
             ),
             cpus=float(limits["cpus"]),
             memory_bytes=int(limits["memory_bytes"]),
+            memory_swap_bytes=int(limits["memory_swap_bytes"]),
             pids=int(limits["pids"]),
             file_size_bytes=int(limits["file_size_bytes"]),
             open_files=int(limits["open_files"]),
@@ -115,8 +170,29 @@ def load_config(path: Path = CONFIG_PATH) -> RunnerConfig:
                 for item in value["allowed_output_names"]
             ),
         )
-        if config.runtime != "podman-rootless":
-            raise ValueError("runtime must be podman-rootless")
+        if type(config.rootless) is not bool:
+            raise ValueError("rootless must be boolean")
+        expected_profile = {
+            PROFILE_PRODUCTION_ROOTLESS: (
+                "podman-rootless",
+                "podman",
+                "rootless",
+                True,
+            ),
+            PROFILE_PILOT_DOCKER: (
+                "docker",
+                "docker",
+                "rootful-daemon",
+                False,
+            ),
+        }[profile]
+        if (
+            config.runtime,
+            config.runtime_name,
+            config.runtime_mode,
+            config.rootless,
+        ) != expected_profile:
+            raise ValueError(f"invalid runtime profile configuration: {profile}")
         if config.runtime_user != "65532:65532":
             raise ValueError("runtime_user must be 65532:65532")
         if config.inner_command != EXPECTED_INNER_COMMAND:
@@ -130,6 +206,7 @@ def load_config(path: Path = CONFIG_PATH) -> RunnerConfig:
             for value in (
                 config.cpus,
                 config.memory_bytes,
+                config.memory_swap_bytes,
                 config.pids,
                 config.file_size_bytes,
                 config.open_files,
@@ -140,6 +217,9 @@ def load_config(path: Path = CONFIG_PATH) -> RunnerConfig:
             )
         ):
             raise ValueError("runner limits must be positive")
+        for field, expected in EXPECTED_PROFILE_LIMITS[profile].items():
+            if getattr(config, field) != expected:
+                raise ValueError(f"{profile} limit {field} must be {expected}")
         return config
     except (KeyError, TypeError, ValueError) as exc:
         raise RunnerError(f"invalid runner configuration: {exc}") from exc
@@ -153,8 +233,7 @@ def build_run_command(
     config: RunnerConfig,
 ) -> list[str]:
     """Build the only container command this runner permits."""
-
-    return [
+    command = [
         runtime,
         "run",
         "--rm",
@@ -162,17 +241,17 @@ def build_run_command(
         "none",
         "--user",
         config.runtime_user,
-        "--userns",
-        "private",
         "--cap-drop",
         "ALL",
         "--security-opt",
         "no-new-privileges",
         "--read-only",
         "--cpus",
-        str(config.cpus),
+        _format_cpu_limit(config.cpus),
         "--memory",
         str(config.memory_bytes),
+        "--memory-swap",
+        str(config.memory_swap_bytes),
         "--pids-limit",
         str(config.pids),
         "--ulimit",
@@ -186,7 +265,7 @@ def build_run_command(
         "--tmpfs",
         f"/work:rw,nosuid,nodev,size={config.work_bytes},uid=65532,gid=65532,mode=700",
         "--mount",
-        f"type=bind,src={input_root},dst=/input,ro",
+        f"type=bind,src={input_root},dst=/input,{_input_mount_mode(config)}",
         "--mount",
         f"type=bind,src={output_root},dst=/output,rw",
         "--workdir",
@@ -206,6 +285,18 @@ def build_run_command(
         image,
         *config.inner_command[1:],
     ]
+    if config.profile == PROFILE_PRODUCTION_ROOTLESS:
+        index = command.index("--cap-drop")
+        command[index:index] = ["--userns", "private"]
+    return command
+
+
+def _input_mount_mode(config: RunnerConfig) -> str:
+    return "ro" if config.profile == PROFILE_PRODUCTION_ROOTLESS else "readonly"
+
+
+def _format_cpu_limit(value: float) -> str:
+    return str(int(value)) if value.is_integer() else str(value)
 
 
 def run_isolated(
@@ -213,12 +304,15 @@ def run_isolated(
     image: str,
     input_root: Path,
     output: Path,
-    runtime: str = "podman",
+    profile: str = PROFILE_PRODUCTION_ROOTLESS,
+    acknowledge_rootful_runtime: bool = False,
+    runtime: str | None = None,
     wall_timeout: float | None = None,
     force_output: bool = False,
     config_path: Path = CONFIG_PATH,
 ) -> RunResult:
-    config = load_config(config_path)
+    _validate_profile_selection(profile, acknowledge_rootful_runtime)
+    config = load_config(config_path, profile=profile)
     runtime_path = _validate_runtime(runtime, config)
     image = _validate_image(image)
     input_root = _validate_input_root(input_root)
@@ -231,11 +325,11 @@ def run_isolated(
     workspace_tree_sha256 = sha256_workspace_tree(workspace_path)
     identity.update(
         {
-            "rootless": True,
             "network_policy": "none",
             "resource_limits": {
                 "cpus": config.cpus,
                 "memory_bytes": config.memory_bytes,
+                "memory_swap_bytes": config.memory_swap_bytes,
                 "pids": config.pids,
                 "file_size_bytes": config.file_size_bytes,
                 "open_files": config.open_files,
@@ -251,8 +345,10 @@ def run_isolated(
         }
     )
     timeout = config.wall_seconds if wall_timeout is None else wall_timeout
-    if timeout <= 0:
-        raise RunnerError("wall timeout must be greater than zero")
+    if timeout <= 0 or timeout > config.wall_seconds:
+        raise RunnerError(
+            f"wall timeout must be between zero and {config.wall_seconds} seconds"
+        )
 
     with tempfile.TemporaryDirectory(prefix=".rtlbench-runner-output-") as output_tmp:
         with tempfile.TemporaryDirectory(prefix=".rtlbench-runner-env-") as env_tmp:
@@ -262,7 +358,9 @@ def run_isolated(
             returncode, timed_out = _execute(
                 command,
                 timeout=timeout,
-                environment=_runtime_environment(Path(env_tmp)),
+                environment=_runtime_environment(
+                    Path(env_tmp), include_runtime_dir=config.rootless
+                ),
             )
             _reject_unexpected_output(staged_output, config)
             final = staged_output / "candidate_evidence.jsonl"
@@ -313,21 +411,50 @@ def validate_candidate_evidence_file(path: Path, *, max_bytes: int) -> list[dict
         raise RunnerError(str(exc)) from exc
 
 
-def _validate_runtime(runtime: str, config: RunnerConfig) -> str:
+def _validate_profile_selection(profile: str, acknowledge_rootful_runtime: bool) -> None:
+    if profile not in PROFILES:
+        raise RunnerError(f"unknown isolation profile: {profile}")
+    if profile == PROFILE_PILOT_DOCKER and not acknowledge_rootful_runtime:
+        raise RunnerError(
+            "pilot-docker requires --acknowledge-rootful-runtime"
+        )
+    if profile == PROFILE_PRODUCTION_ROOTLESS and acknowledge_rootful_runtime:
+        raise RunnerError(
+            "--acknowledge-rootful-runtime is only valid with pilot-docker"
+        )
+
+
+def _validate_runtime(runtime: str | None, config: RunnerConfig) -> str:
+    runtime = runtime or config.runtime_name
     runtime_path = shutil.which(runtime)
     if runtime_path is None:
-        raise RunnerError("rootless Podman is required but podman was not found")
-    if Path(runtime_path).name != "podman":
-        raise RunnerError("only the podman rootless runtime is supported")
-    result = _run_checked(
-        [runtime_path, "info", "--format", "{{.Host.Security.Rootless}}"],
-        timeout=10.0,
-        environment=_runtime_environment(None),
-    )
-    if result.returncode != 0 or result.stdout.strip().lower() != "true":
-        raise RunnerError("podman must report rootless=true")
-    if config.runtime != "podman-rootless":
-        raise RunnerError("runner configuration does not require podman-rootless")
+        raise RunnerError(f"{config.runtime_name} runtime was not found")
+    if Path(runtime_path).name != config.runtime_name:
+        raise RunnerError(
+            f"{config.profile} requires the {config.runtime_name} runtime executable"
+        )
+    if config.profile == PROFILE_PRODUCTION_ROOTLESS:
+        result = _run_checked(
+            [runtime_path, "info", "--format", "{{.Host.Security.Rootless}}"],
+            timeout=10.0,
+            environment=_runtime_environment(None, include_runtime_dir=True),
+        )
+        if result.returncode != 0 or result.stdout.strip().lower() != "true":
+            raise RunnerError("podman must report rootless=true")
+    else:
+        result = _run_checked(
+            [runtime_path, "version", "--format", "{{json .Server.Version}}"],
+            timeout=10.0,
+            environment=_runtime_environment(None, include_runtime_dir=False),
+        )
+        if result.returncode != 0:
+            raise RunnerError("docker runtime is not usable")
+        try:
+            version = json.loads(result.stdout.strip())
+        except json.JSONDecodeError as exc:
+            raise RunnerError("docker version probe did not return JSON") from exc
+        if not isinstance(version, str) or not version:
+            raise RunnerError("docker version probe did not return a server version")
     return runtime_path
 
 
@@ -394,7 +521,7 @@ def _read_image_identity(runtime: str, image: str, config: RunnerConfig) -> dict
     result = _run_checked(
         [runtime, "image", "inspect", "--format", "{{json .Config.Labels}}", image],
         timeout=10.0,
-        environment=_runtime_environment(None),
+        environment=_runtime_environment(None, include_runtime_dir=config.rootless),
     )
     if result.returncode != 0:
         raise RunnerError("could not inspect the immutable RTLBench image")
@@ -405,6 +532,11 @@ def _read_image_identity(runtime: str, image: str, config: RunnerConfig) -> dict
     if not isinstance(labels, dict):
         raise RunnerError("RTLBench image labels are missing")
     identity: dict[str, Any] = {
+        "schema_version": IDENTITY_SCHEMA_VERSION,
+        "profile": config.profile,
+        "runtime": config.runtime_name,
+        "runtime_mode": config.runtime_mode,
+        "rootless": config.rootless,
         "runner_config_version": config.version,
         "image": image,
         "image_digest": image.split("@", 1)[1],
@@ -458,7 +590,9 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
         process.wait(timeout=5.0)
 
 
-def _runtime_environment(env_root: Path | None) -> dict[str, str]:
+def _runtime_environment(
+    env_root: Path | None, *, include_runtime_dir: bool = True
+) -> dict[str, str]:
     if env_root is None:
         environment = {
             "PATH": "/usr/bin:/bin",
@@ -480,9 +614,10 @@ def _runtime_environment(env_root: Path | None) -> dict[str, str]:
             "LANG": "C",
             "LC_ALL": "C",
         }
-    xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
-    if xdg_runtime and Path(xdg_runtime).is_dir():
-        environment["XDG_RUNTIME_DIR"] = xdg_runtime
+    if include_runtime_dir:
+        xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
+        if xdg_runtime and Path(xdg_runtime).is_dir():
+            environment["XDG_RUNTIME_DIR"] = xdg_runtime
     return environment
 
 
@@ -553,25 +688,44 @@ def _string(value: Any, name: str) -> str:
     return value
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run RTLBench in rootless Podman")
+def _build_parser(*, require_profile: bool = False, allow_profile: bool = True) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run RTLBench in an isolated container")
+    if allow_profile:
+        parser.add_argument(
+            "--profile",
+            required=require_profile,
+            choices=sorted(PROFILES),
+            help="isolation profile",
+        )
     parser.add_argument("--image", required=True, help="immutable IMAGE@sha256:<digest>")
     parser.add_argument("--input", type=Path, required=True, help="read-only candidate handoff")
     parser.add_argument("--output", type=Path, required=True, help="host evidence JSONL output")
-    parser.add_argument("--runtime", default="podman")
+    parser.add_argument("--acknowledge-rootful-runtime", action="store_true")
+    parser.add_argument("--runtime")
     parser.add_argument("--wall-timeout", type=float)
     parser.add_argument("--force-output", action="store_true")
     parser.add_argument("--config", type=Path, default=CONFIG_PATH)
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    require_profile: bool = False,
+    default_profile: str = PROFILE_PRODUCTION_ROOTLESS,
+    allow_profile: bool = True,
+) -> int:
+    args = _build_parser(
+        require_profile=require_profile, allow_profile=allow_profile
+    ).parse_args(argv)
+    profile = args.profile if allow_profile else default_profile
     try:
         result = run_isolated(
             image=args.image,
             input_root=args.input,
             output=args.output,
+            profile=profile,
+            acknowledge_rootful_runtime=args.acknowledge_rootful_runtime,
             runtime=args.runtime,
             wall_timeout=args.wall_timeout,
             force_output=args.force_output,

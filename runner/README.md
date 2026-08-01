@@ -1,101 +1,127 @@
-# Rootless RTLBench runner
+# Isolated RTLBench runner
 
-This directory is the execution boundary for `rtlbench verify-candidates`.
-It deliberately supports rootless Podman only. A missing runtime, a rootful
-runtime, a mutable image reference, missing image identity labels, a handoff
-symlink, or a handoff containing `reference.sv` fails closed before candidate
-execution.
+`runner/run_isolated.py` is the profile-aware execution boundary for
+`rtlbench verify-candidates`. It supports two explicit profiles:
 
-The runner mounts exactly these paths inside the container:
+* `production-rootless` uses rootless Podman and is the required profile for
+  shared or production systems.
+* `pilot-docker` uses an ordinary rootful Docker daemon for a small,
+  sequential, single-machine pilot. It is a weaker host boundary and requires
+  an explicit acknowledgement on every invocation.
+
+There is no automatic Docker/Podman fallback and no implicit profile choice in
+the primary CLI. `runner/run_rootless.py` remains a compatibility wrapper that
+always selects `production-rootless`.
+
+## Immutable image
+
+Both profiles use the same immutable image format. Build the image from a
+digest-qualified base with exact package and executable versions, then use its
+repository digest—not a mutable tag—as the execution reference:
 
 ```text
-/input   read-only candidate handoff
-/output  writable evidence staging directory
-/work    bounded writable tmpfs for compiler/simulator scratch
-/tmp     bounded writable tmpfs for temporary files
+localhost/rtlbench-runner@sha256:<64-lowercase-hex-digest>
 ```
 
-The runtime user is `65532:65532`. The launcher applies `--network none`,
-`--read-only`, `--cap-drop ALL`, `no-new-privileges`, private user and IPC
-namespaces, CPU, memory, PID, file-size, open-file, tmpfs, and wall-clock
-limits. It passes only fixed locale, path, home, and temporary-directory
-variables to the container; host home directories, SSH keys, credential files,
-cloud credentials, and container sockets are never mounted or forwarded.
+The image must contain the fixed `rtlbench` entrypoint, non-root user
+`65532:65532`, verified RTLBench/tool-version labels, and the working CLI help
+smoke test. Candidate execution does not need network access after the image
+has been imported or pulled.
 
-## Build an immutable image
+## Local pilot
 
-Use a digest-qualified Python base image and exact Debian package versions.
-The build script refuses a base image without a SHA-256 digest and records the
-RTLBench commit, Python version, Icarus/`vvp`, Verilator, Yosys, and runner
-configuration versions as image labels:
+For a small Linux machine, run one candidate manifest at a time with the
+explicit rootful-runtime acknowledgement. The output directory must be
+separate from the read-only handoff:
 
 ```bash
-./runner/build_rootless_image.sh \
-  --base-image python:3.11-slim@sha256:<pinned-base-digest> \
-  --tag localhost/rtlbench-runner:pilot \
-  --rtlbench-commit "$(git rev-parse HEAD)" \
-  --python-version <exact-python-version> \
-  --iverilog-package-version <exact-iverilog-package-version> \
-  --iverilog-version <exact-iverilog-runtime-version> \
-  --vvp-version <exact-vvp-runtime-version> \
-  --verilator-package-version <exact-verilator-package-version> \
-  --verilator-version <exact-verilator-runtime-version> \
-  --yosys-package-version <exact-yosys-package-version> \
-  --yosys-version <exact-yosys-runtime-version>
-```
-
-The build script requires that the commit argument exactly match a clean
-checked-out `git rev-parse HEAD`. During the image build, Python, installed
-Debian package versions, and executable-reported tool versions are checked
-against the supplied values; a mismatch fails the build. Build with
-`--pull=never`, then inspect the resulting image and use only its
-digest-qualified reference with the launcher. The launcher requires all
-identity labels and emits a deterministic `candidate_evidence.jsonl.runner.json`
-sidecar containing the image digest, RTLBench commit, tool versions,
-rootless/network/resource policies, the manifest SHA-256, the deterministic
-workspace-tree SHA-256, and the final evidence SHA-256. It contains no
-timestamps or host paths.
-
-## Run a handoff
-
-The input directory must contain `candidate_manifest.jsonl` and `workspace/`.
-The output file must be outside that read-only directory:
-
-```bash
-python runner/run_rootless.py \
+python runner/run_isolated.py \
+  --profile pilot-docker \
+  --acknowledge-rootful-runtime \
   --image localhost/rtlbench-runner@sha256:<immutable-image-digest> \
   --input /path/to/attempt_01 \
   --output /path/to/isolated-output/candidate_evidence.jsonl
 ```
 
-Inside the image the launcher executes exactly:
+`pilot-docker` is intended for a constrained local pilot only. It never
+silently replaces rootless Podman and is not production-approved. The default
+limits are conservative for an 8 GB host: one CPU, 512 MiB container memory,
+512 MiB memory+swap, 64 processes, 32 MiB maximum file size, 256 open files,
+128 MiB `/work`, 64 MiB `/tmp`, 32 MiB evidence, and a 120-second outer wall
+clock. The 512 MiB value is the container limit, not the total memory required
+by the host, Docker daemon, image, and kernel.
+
+The Docker profile applies:
 
 ```text
-rtlbench verify-candidates \
-  --manifest /input/candidate_manifest.jsonl \
-  --output /output/candidate_evidence.jsonl \
-  --workspace-root /input/workspace \
-  --work-dir /work \
-  --force
+network none                         user 65532:65532
+read-only root filesystem             all capabilities dropped
+no-new-privileges                     read-only /input bind mount
+separate writable /output bind       bounded writable /work tmpfs
+bounded writable /tmp tmpfs           fixed rtlbench command
+stdin disabled                        process-group cleanup
 ```
 
-The staging directory accepts only the final evidence file and the verifier's
-managed `.rtlbench-partial` file. Final evidence is schema-checked before it
-is atomically copied to the requested host output. Compile failures,
-functional mismatches, timeouts, missing mismatch results, and candidate-level
-internal failures are normal evidence rows and are preserved. If the outer
-wall clock expires or the container fails before final publication, a managed
-partial file is copied beside the requested output and the launcher returns a
-non-zero status.
+It does not permit `--privileged`, host networking, host PID/IPC, devices,
+Docker socket mounts, host-home or repository mounts, credential/secret
+mounts, arbitrary environment forwarding, mutable image tags, or arbitrary
+container commands.
 
-The output path must remain outside the read-only input handoff. After the
-isolated run and evidence validation, copy the final evidence into the
-canonical RTLSpecializer attempt directory.
+## Production execution
 
-Do not run the launcher against a real candidate until the synthetic runner
-acceptance suite has passed in the same immutable image. The acceptance suite
-covers passing, compile failure, functional mismatch, timeout, missing result,
-schema rejection, input-byte preservation, forbidden reference RTL, security
-flags, network isolation configuration, and cleanup. A rootless Podman
-integration run is required before promoting an image; fake-runtime unit tests
-do not substitute for that final image check.
+Use rootless Podman explicitly on shared or production systems:
+
+```bash
+python runner/run_isolated.py \
+  --profile production-rootless \
+  --image localhost/rtlbench-runner@sha256:<immutable-image-digest> \
+  --input /path/to/attempt_01 \
+  --output /path/to/isolated-output/candidate_evidence.jsonl
+```
+
+The launcher requires `podman info --format '{{.Host.Security.Rootless}}'` to
+normalize to `true`. It uses the stronger rootless profile with a private user
+namespace, non-root execution, no network, read-only input and root
+filesystem, dropped capabilities, no-new-privileges, bounded scratch and
+resource limits. Passing `--acknowledge-rootful-runtime` to this profile is an
+error.
+
+## Filesystem and identity boundary
+
+The fixed container layout is:
+
+```text
+/input   read-only candidate handoff
+/output  writable evidence staging only
+/work    bounded disposable compiler/simulator work
+/tmp     bounded temporary filesystem
+```
+
+The input must contain `candidate_manifest.jsonl` and `workspace/`; symlinks,
+special files, and any `reference.sv` are rejected. Never mount a host home,
+SSH keys, cloud credentials, production secrets, repository root as writable,
+or a Docker socket. The launcher forwards only its fixed sanitized environment
+and never reads Docker client configuration or registry credentials.
+
+Final evidence is validated by RTLBench's strict
+`rtl_candidate_evidence_v0.1` validator before atomic publication. Partial
+evidence is preserved on a bounded timeout or runtime failure. The adjacent
+`candidate_evidence.jsonl.runner.json` sidecar records the profile/runtime
+mode, image and tool identity, resource policy, manifest hash, deterministic
+workspace-tree hash, and final/partial evidence hashes. It contains no
+timestamps, hostnames, usernames, host paths, or secret paths.
+
+The execution sequence is:
+
+```text
+build/import immutable image
+→ run the synthetic live matrix
+→ run candidate 1 only
+→ validate evidence and sidecar
+→ copy validated evidence into the canonical RTLSpecializer attempt directory
+→ ingest it
+```
+
+Do not execute generated RTL directly on the host. Do not expose a real
+candidate until the selected profile has passed its live synthetic acceptance
+matrix.
