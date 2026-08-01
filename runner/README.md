@@ -92,10 +92,10 @@ The Docker profile applies:
 ```text
 network none                         user 65532:65532
 read-only root filesystem             all capabilities dropped
-no-new-privileges                     read-only /input bind mount
-separate writable /output bind       bounded writable /work tmpfs
+no-new-privileges                     read-only /input named volume
+separate writable /output host bind  bounded writable /work tmpfs
 bounded writable /tmp tmpfs           fixed rtlbench command
-stdin disabled                        process-group cleanup
+candidate stdin disabled               process-group cleanup
 ```
 
 It does not permit `--privileged`, host networking, host PID/IPC, devices,
@@ -103,9 +103,22 @@ Docker socket mounts, host-home or repository mounts, credential/secret
 mounts, arbitrary environment forwarding, mutable image tags, or arbitrary
 container commands.
 
-The `/input` bind mount is explicitly read-only. The `/output` bind mount is
-writable by default because no read-only option is supplied. The `rw` options
-on `/tmp` and `/work` are tmpfs options and remain unchanged.
+The canonical handoff is never mounted directly into a candidate container.
+The launcher creates a normalized private snapshot containing only
+`candidate_manifest.jsonl` and `workspace/`, transfers it through stdin into a
+short-lived runtime-managed named volume, probes that volume as UID/GID
+`65532:65532`, and mounts it read-only as `/input`. Docker uses
+`type=volume,src=<temporary-input-volume>,dst=/input,readonly,volume-nocopy`;
+Podman uses the equivalent already-created named-volume mount with `ro`.
+The `/output` host bind mount is writable by default because no read-only
+option is supplied. The `rw` options on `/tmp` and `/work` are tmpfs options
+and remain unchanged.
+
+Canonical handoffs may remain private mode `0700`; the runner never chmods or
+chowns them. The population helper is the only operation that uses UID 0,
+and it runs fixed extraction code only. It does not execute RTL, a testbench,
+or manifest content. The temporary input volume is removed before evidence
+publication completes and is never pruned together with unrelated volumes.
 
 ## Production execution
 
@@ -131,7 +144,7 @@ error.
 The fixed container layout is:
 
 ```text
-/input   read-only candidate handoff
+/input   read-only runtime-managed candidate snapshot
 /output  writable evidence staging only
 /work    bounded disposable compiler/simulator work
 /tmp     bounded temporary filesystem
@@ -142,6 +155,24 @@ special files, and any `reference.sv` are rejected. Never mount a host home,
 SSH keys, cloud credentials, production secrets, repository root as writable,
 or a Docker socket. The launcher forwards only its fixed sanitized environment
 and never reads Docker client configuration or registry credentials.
+
+The private archive is uncompressed tar, sorted by normalized POSIX path, and
+limited by RTLBench's default total run-input limit. Its entries use normalized
+metadata (`uid/gid 0`, empty owner names, `mtime 0`), with directories `0555`
+and files `0444`; the host archive is a launcher-owned `0600` file in a
+launcher-private temporary directory. The runtime-managed volume name is
+cryptographically random (`rtlbench-input-` plus 32 lowercase hex digits) and
+has the fixed label
+`io.rtlbench.runner.temporary-input=rtlbench_runtime_input_v0.1`. The probe
+must report the same manifest and workspace-tree hashes as the canonical host
+handoff before candidate execution. Cleanup removes managed containers, the
+temporary volume, the private archive, and launcher temporary directories;
+cleanup failure fails closed without publishing evidence.
+The host launcher and the runtime-user probe use the same canonical
+`rtlbench.candidate_evidence.sha256_workspace_tree` implementation. The probe
+still performs an independent validation pass for staged types, readability,
+traversal, and forbidden entries; that pass does not define another hash
+serialization format.
 
 Both the image and launcher pin module discovery to
 `PYTHONPATH=/opt/rtlbench/src`. This value is fixed to the immutable image

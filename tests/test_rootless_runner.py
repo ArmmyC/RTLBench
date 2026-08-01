@@ -2,10 +2,13 @@ import copy
 import hashlib
 import json
 import os
+import re
 import shutil
+import socket
 import subprocess
 import stat
 import sys
+import tarfile
 import textwrap
 from pathlib import Path
 
@@ -140,6 +143,84 @@ def _tree_hashes(root: Path) -> dict[str, str]:
     return result
 
 
+def _legacy_recursive_workspace_hash(root: Path) -> str:
+    """Reproduce the pre-fix depth-first probe ordering for regression tests."""
+
+    digest = hashlib.sha256()
+
+    def file_hash(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def visit(current: Path) -> None:
+        for path in sorted(current.iterdir(), key=lambda item: item.name):
+            relative = path.relative_to(root).as_posix()
+            if path.is_dir():
+                digest.update(b"D\0" + relative.encode() + b"\n")
+                visit(path)
+            else:
+                digest.update(
+                    b"F\0"
+                    + relative.encode()
+                    + b"\0"
+                    + file_hash(path).encode()
+                    + b"\n"
+                )
+
+    visit(root)
+    return digest.hexdigest()
+
+
+def test_probe_uses_canonical_workspace_hash_for_mixed_siblings(tmp_path: Path):
+    volume = tmp_path / "volume"
+    workspace = volume / "workspace"
+    (workspace / "alpha" / "nested").mkdir(parents=True)
+    (workspace / "beta").mkdir()
+    (volume / "candidate_manifest.jsonl").write_text("manifest\n", encoding="utf-8")
+    (workspace / "root_file.sv").write_text("root\n", encoding="utf-8")
+    (workspace / "alpha" / "alpha_file.sv").write_text("alpha\n", encoding="utf-8")
+    (workspace / "alpha" / "nested" / "nested_file.sv").write_text(
+        "nested\n", encoding="utf-8"
+    )
+    (workspace / "beta" / "beta_file.sv").write_text("beta\n", encoding="utf-8")
+
+    for path in volume.rglob("*"):
+        if path.is_file():
+            path.chmod(0o444)
+    for path in sorted(volume.rglob("*"), reverse=True):
+        if path.is_dir():
+            path.chmod(0o555)
+    volume.chmod(0o555)
+
+    root_literal = '_ROOT = "/input"'
+    program = runner.PROBE_INPUT_VOLUME_PROGRAM
+    assert program.count(root_literal) == 1
+    rewritten = program.replace(
+        root_literal,
+        "_ROOT = " + repr(str(volume)),
+        1,
+    )
+    environment = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONPATH": str(runner.SOURCE_ROOT),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", rewritten],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    reported = json.loads(result.stdout)
+    expected = runner.sha256_workspace_tree(workspace)
+    assert reported["manifest_sha256"] == runner.sha256_file(
+        volume / "candidate_manifest.jsonl"
+    )
+    assert reported["workspace_tree_sha256"] == expected
+    assert _legacy_recursive_workspace_hash(workspace) != expected
+
+
 def _fake_podman(tmp_path: Path, *, mode: str) -> tuple[Path, Path]:
     return _fake_runtime(tmp_path, mode=mode, backend="podman")
 
@@ -167,12 +248,21 @@ def _fake_runtime(
         "sha256:" + "c" * 64 if mode == "id_mismatch" else INSPECTED_IMAGE_ID
     )
     synthetic_row = repr(_evidence_for_category(synthetic_categories.get(mode, "passed")))
+    volume_root = tmp_path / "fake-volumes"
+    volume_root.mkdir(exist_ok=True)
+    volume_labels = repr({runner.INPUT_VOLUME_LABEL: runner.INPUT_VOLUME_LABEL_VALUE})
     body = textwrap.dedent(
         f"""
         #!{sys.executable}
+        import contextlib
+        import hashlib
+        import io
         import json
         import os
+        import shutil
+        import stat
         import sys
+        import tarfile
         import time
         from pathlib import Path
 
@@ -207,17 +297,143 @@ def _fake_runtime(
                 raise SystemExit(0)
             print(json.dumps({LABELS!r}))
             raise SystemExit(0)
+        if args[:2] == ["volume", "inspect"]:
+            volume_name = args[-1]
+            volume = Path({str(volume_root)!r}) / volume_name
+            if not volume.exists():
+                raise SystemExit(1)
+            if "--format" in args:
+                print(json.dumps({volume_labels}))
+            raise SystemExit(0)
+        if args[:2] == ["volume", "create"]:
+            volume_name = args[-1]
+            (Path({str(volume_root)!r}) / volume_name).mkdir()
+            print(volume_name)
+            raise SystemExit(0)
+        if args[:2] == ["volume", "rm"]:
+            volume_name = args[-1]
+            if {mode!r} == "volume_remove_failure":
+                raise SystemExit(1)
+            volume = Path({str(volume_root)!r}) / volume_name
+            # A real container runtime removes the volume as the daemon/runtime
+            # owner, independently of the normalized read-only modes inside it.
+            # Model that behavior so the fake runtime is stable across Python
+            # versions and does not turn cleanup into a permissions test.
+            for current, directories, files in os.walk(volume, topdown=False):
+                for name in files:
+                    os.chmod(Path(current) / name, 0o600)
+                for name in directories:
+                    os.chmod(Path(current) / name, 0o700)
+            os.chmod(volume, 0o700)
+            shutil.rmtree(volume)
+            print(volume_name)
+            raise SystemExit(0)
+        if args[:1] == ["ps"]:
+            raise SystemExit(0)
+        if args[:1] == ["rm"]:
+            raise SystemExit(0)
         if args[:1] != ["run"]:
             raise SystemExit(2)
         mounts = [args[index + 1] for index, value in enumerate(args[:-1]) if value == "--mount"]
+        input_mount = next(value for value in mounts if "dst=/input" in value)
+        input_volume_name = next(part[4:] for part in input_mount.split(",") if part.startswith("src="))
+        input_root = Path({str(volume_root)!r}) / input_volume_name
+        entrypoint = (
+            args[args.index("--entrypoint") + 1]
+            if "--entrypoint" in args
+            else "rtlbench"
+        )
+        if entrypoint == "/usr/local/bin/python":
+            program = args[args.index("-c") + 1]
+            if {mode!r} == "populate_failure" and "tarfile.open" in program:
+                print("synthetic population failure", file=sys.stderr, flush=True)
+                raise SystemExit(1)
+            if "tarfile.open" in program:
+                with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as archive:
+                    if sys.version_info >= (3, 12):
+                        archive.extractall(input_root, filter="data")
+                    else:
+                        archive.extractall(input_root)
+                raise SystemExit(0)
+            if {mode!r} == "probe_failure":
+                print("synthetic probe failure", file=sys.stderr, flush=True)
+                raise SystemExit(1)
+            if {mode!r} == "probe_malformed":
+                print("not-json")
+                raise SystemExit(0)
+            if {mode!r} == "probe_unexpected":
+                print(json.dumps({{"unexpected": True}}))
+                raise SystemExit(0)
+            if {mode!r} == "probe_excessive":
+                print("x" * {runner.PROBE_OUTPUT_LIMIT_BYTES + 1})
+                raise SystemExit(0)
+            if program != {runner.PROBE_INPUT_VOLUME_PROGRAM!r}:
+                raise SystemExit(2)
+            root_literal = '_ROOT = "/input"'
+            if program.count(root_literal) != 1:
+                raise SystemExit(2)
+            rewritten = program.replace(
+                root_literal,
+                "_ROOT = " + repr(str(input_root)),
+                1,
+            )
+            sys.path.insert(0, {str(runner.SOURCE_ROOT)!r})
+            namespace = {{
+                "__name__": "__main__",
+                "__file__": "<rtlbench-input-probe>",
+            }}
+            captured = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(captured):
+                    exec(
+                        compile(
+                            rewritten,
+                            "<rtlbench-input-probe>",
+                            "exec",
+                        ),
+                        namespace,
+                        namespace,
+                    )
+            except SystemExit as error:
+                exit_code = error.code
+            else:
+                exit_code = 0
+            probe_output = captured.getvalue()
+            if exit_code == 0 and {mode!r} in {{
+                "probe_manifest_mismatch",
+                "probe_workspace_mismatch",
+                "probe_both_mismatch",
+                "probe_mismatch",
+            }}:
+                probe_value = json.loads(probe_output)
+                if {mode!r} == "probe_manifest_mismatch":
+                    probe_value["manifest_sha256"] = "0" * 64
+                elif {mode!r} == "probe_workspace_mismatch":
+                    probe_value["workspace_tree_sha256"] = "0" * 64
+                else:
+                    probe_value["manifest_sha256"] = "0" * 64
+                    probe_value["workspace_tree_sha256"] = "0" * 64
+                probe_output = json.dumps(
+                    probe_value,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ) + "\\n"
+            record[-1]["probe_program"] = program
+            record[-1]["probe_output"] = probe_output
+            log.write_text(json.dumps(record), encoding="utf-8")
+            if probe_output:
+                print(probe_output, end="")
+            raise SystemExit(exit_code)
         output_mount = next(value for value in mounts if "dst=/output" in value)
         output_root = Path(next(part[4:] for part in output_mount.split(",") if part.startswith("src=")))
-        input_mount = next(value for value in mounts if "dst=/input" in value)
-        input_root = Path(next(part[4:] for part in input_mount.split(",") if part.startswith("src=")))
+        if {mode!r} == "startup_failure":
+            print("synthetic candidate startup failure", file=sys.stderr, flush=True)
+            raise SystemExit(125)
         if {mode!r} == "mutate":
-            (input_root / "candidate_manifest.jsonl").write_text(
-                "mutated by fake runtime\\n", encoding="utf-8"
-            )
+            for candidate in Path({str(tmp_path)!r}).rglob("candidate_manifest.jsonl"):
+                if "handoff" in candidate.parts:
+                    candidate.write_text("mutated by fake runtime\\n", encoding="utf-8")
+                    break
         if {mode!r} == "diagnostic":
             print("synthetic stdout marker", flush=True)
             print("synthetic container traceback", file=sys.stderr, flush=True)
@@ -232,7 +448,11 @@ def _fake_runtime(
             time.sleep(30)
             raise SystemExit(1)
         if {mode!r} == "sanitize_diagnostic":
-            print("input path: " + str(input_root), flush=True)
+            canonical_input = next(
+                candidate for candidate in Path({str(tmp_path)!r}).rglob("candidate_manifest.jsonl")
+                if "handoff" in candidate.parts
+            ).parent
+            print("input path: " + str(canonical_input), flush=True)
             print("output path: " + str(output_root), flush=True)
             print("environment path: " + os.environ.get("HOME", ""), flush=True)
             print(
@@ -525,7 +745,12 @@ def test_wrapper_forwards_every_argument_unchanged(
     fake_podman, log = _fake_podman(tmp_path, mode="passing")
     output = tmp_path / "evidence.jsonl"
     runner.run_isolated(image=IMAGE, input_root=handoff, output=output, runtime=str(fake_podman))
-    run_argv = json.loads(log.read_text())[-1]["argv"]
+    run_argv = next(
+        item["argv"]
+        for item in reversed(json.loads(log.read_text()))
+        if item["argv"][:1] == ["run"]
+        and item["argv"][item["argv"].index("--entrypoint") + 1] == "rtlbench"
+    )
     image_index = run_argv.index(IMAGE)
     assert run_argv[image_index + 1 :] == list(runner.EXPECTED_INNER_COMMAND[1:])
 
@@ -637,12 +862,12 @@ EXPECTED_CONTAINER_ENVIRONMENT = {
 
 def test_docker_pilot_command_is_fixed_and_bounded(tmp_path: Path):
     config = runner.load_config(profile=runner.PROFILE_PILOT_DOCKER)
-    input_root = tmp_path / "input"
+    input_volume = "rtlbench-input-" + "a" * 32
     output_root = tmp_path / "output"
     command = runner.build_run_command(
         "/usr/bin/docker",
         IMAGE,
-        input_root,
+        input_volume,
         output_root,
         config,
     )
@@ -668,7 +893,9 @@ def test_docker_pilot_command_is_fixed_and_bounded(tmp_path: Path):
     assert "/tmp:rw,nosuid,nodev,noexec,size=67108864,mode=1777" in command
     assert "/work:rw,nosuid,nodev,size=134217728,uid=65532,gid=65532,mode=700" in command
     mounts = _bind_mounts(command)
-    assert mounts["/input"] == f"type=bind,src={input_root},dst=/input,readonly"
+    assert mounts["/input"] == (
+        f"type=volume,src={input_volume},dst=/input,readonly,volume-nocopy"
+    )
     assert mounts["/output"] == f"type=bind,src={output_root},dst=/output"
     assert ",rw" not in mounts["/output"]
     assert ",readonly" not in mounts["/output"]
@@ -696,10 +923,11 @@ def test_docker_pilot_command_is_fixed_and_bounded(tmp_path: Path):
 def test_both_profiles_use_the_same_fixed_container_environment(
     tmp_path: Path, profile: str
 ):
+    input_volume = "rtlbench-input-" + "b" * 32
     command = runner.build_run_command(
         "docker" if profile == runner.PROFILE_PILOT_DOCKER else "podman",
         IMAGE,
-        tmp_path / "input",
+        input_volume,
         tmp_path / "output",
         runner.load_config(profile=profile),
     )
@@ -725,7 +953,12 @@ def test_host_pythonpath_and_environment_secrets_are_not_forwarded(
         runtime=str(fake_docker),
     )
 
-    record = json.loads(log.read_text(encoding="utf-8"))[-1]
+    record = next(
+        item
+        for item in reversed(json.loads(log.read_text(encoding="utf-8")))
+        if item["argv"][:1] == ["run"]
+        and item["argv"][item["argv"].index("--entrypoint") + 1] == "rtlbench"
+    )
     assert record["container_env"] == EXPECTED_CONTAINER_ENVIRONMENT
     assert record["observed_pythonpath"] is None
     assert record["secret_present"] is False
@@ -735,7 +968,7 @@ def test_host_pythonpath_and_environment_secrets_are_not_forwarded(
 
 
 def test_writable_output_mount_uses_portable_default_syntax(tmp_path: Path):
-    input_root = tmp_path / "input"
+    input_volume = "rtlbench-input-" + "c" * 32
     output_root = tmp_path / "output"
     for runtime, profile, input_mode in (
         ("docker", runner.PROFILE_PILOT_DOCKER, "readonly"),
@@ -744,16 +977,382 @@ def test_writable_output_mount_uses_portable_default_syntax(tmp_path: Path):
         command = runner.build_run_command(
             runtime,
             IMAGE,
-            input_root,
+            input_volume,
             output_root,
             runner.load_config(profile=profile),
         )
         mounts = _bind_mounts(command)
-        assert mounts["/input"] == f"type=bind,src={input_root},dst=/input,{input_mode}"
+        assert mounts["/input"] == (
+            f"type=volume,src={input_volume},dst=/input,{input_mode},volume-nocopy"
+        )
         assert mounts["/output"] == f"type=bind,src={output_root},dst=/output"
         assert ",rw" not in mounts["/output"]
         assert ",readonly" not in mounts["/output"]
         assert ",ro" not in mounts["/output"]
+
+
+def _restrict_handoff_modes(handoff: Path) -> dict[Path, int]:
+    for path in [handoff, *sorted(handoff.rglob("*"))]:
+        path.chmod(0o700 if path.is_dir() else 0o600)
+    return {
+        path: stat.S_IMODE(path.stat().st_mode)
+        for path in [handoff, *sorted(handoff.rglob("*"))]
+    }
+
+
+def test_private_snapshot_archives_restrictive_handoff_without_changing_modes(
+    tmp_path: Path,
+):
+    handoff = _make_handoff(tmp_path / "handoff")
+    manifest_hash = runner.sha256_file(handoff / "candidate_manifest.jsonl")
+    workspace_hash = runner.sha256_workspace_tree(handoff / "workspace")
+    (handoff / "candidate_evidence.jsonl").write_text("old evidence\n", encoding="utf-8")
+    (handoff / "candidate_evidence.jsonl.runner.json").write_text("old sidecar\n", encoding="utf-8")
+    (handoff / "reports").mkdir()
+    (handoff / "reports" / "old.txt").write_text("old report\n", encoding="utf-8")
+    original_modes = _restrict_handoff_modes(handoff)
+    archive_path = tmp_path / "private" / "input.tar"
+
+    snapshot = runner._create_input_snapshot_archive(
+        handoff,
+        archive_path,
+        expected_manifest_sha256=manifest_hash,
+        expected_workspace_tree_sha256=workspace_hash,
+    )
+
+    assert snapshot.manifest_sha256 == manifest_hash
+    assert snapshot.workspace_tree_sha256 == workspace_hash
+    assert snapshot.payload_bytes == sum(
+        path.stat().st_size
+        for path in [handoff / "candidate_manifest.jsonl", * (handoff / "workspace").rglob("*")]
+        if path.is_file()
+    )
+    assert archive_path.is_file()
+    assert not archive_path.is_symlink()
+    assert stat.S_IMODE(archive_path.stat().st_mode) == 0o600
+    assert {path: stat.S_IMODE(path.stat().st_mode) for path in [handoff, *sorted(handoff.rglob("*"))]} == original_modes
+
+
+def test_private_snapshot_archive_contents_are_normalized_and_deterministic(
+    tmp_path: Path,
+):
+    handoff = _make_handoff(tmp_path / "handoff")
+    manifest_hash = runner.sha256_file(handoff / "candidate_manifest.jsonl")
+    workspace_hash = runner.sha256_workspace_tree(handoff / "workspace")
+    first = runner._create_input_snapshot_archive(
+        handoff,
+        tmp_path / "first.tar",
+        expected_manifest_sha256=manifest_hash,
+        expected_workspace_tree_sha256=workspace_hash,
+    )
+    second = runner._create_input_snapshot_archive(
+        handoff,
+        tmp_path / "second.tar",
+        expected_manifest_sha256=manifest_hash,
+        expected_workspace_tree_sha256=workspace_hash,
+    )
+    assert first.archive_path.read_bytes() == second.archive_path.read_bytes()
+    with tarfile.open(first.archive_path, mode="r:") as archive:
+        members = archive.getmembers()
+    names = [member.name.rstrip("/") for member in members]
+    assert names == sorted(names)
+    assert names == [
+        "candidate_manifest.jsonl",
+        "workspace",
+        "workspace/candidate",
+        "workspace/candidate/candidate.sv",
+        "workspace/candidate/testbench.sv",
+    ]
+    assert all(member.uid == 0 and member.gid == 0 for member in members)
+    assert all(member.uname == "" and member.gname == "" for member in members)
+    assert all(member.mtime == 0 for member in members)
+    assert all(
+        stat.S_IMODE(member.mode) == (0o555 if member.isdir() else 0o444)
+        for member in members
+    )
+    assert "verification_plan.jsonl" not in names
+
+
+@pytest.mark.parametrize(
+    "unsafe_kind", ["symlink", "hardlink", "fifo", "socket", "device", "reference"]
+)
+def test_private_snapshot_rejects_unsafe_sources(tmp_path: Path, unsafe_kind: str):
+    handoff = _make_handoff(tmp_path / "handoff")
+    target = handoff / "workspace" / "candidate"
+    expected_manifest = runner.sha256_file(handoff / "candidate_manifest.jsonl")
+    expected_workspace = runner.sha256_workspace_tree(handoff / "workspace")
+    if unsafe_kind == "symlink":
+        (target / "link").symlink_to(target / "candidate.sv")
+    elif unsafe_kind == "fifo":
+        os.mkfifo(target / "pipe")
+    elif unsafe_kind == "socket":
+        sock = socket.socket(socket.AF_UNIX)
+        try:
+            sock.bind(str(target / "socket"))
+        finally:
+            sock.close()
+    elif unsafe_kind == "device":
+        try:
+            os.mknod(target / "device", stat.S_IFCHR | 0o600, os.makedev(1, 7))
+        except PermissionError:
+            pytest.skip("device-node creation is unavailable for this test user")
+    elif unsafe_kind == "hardlink":
+        os.link(target / "candidate.sv", target / "candidate-alias.sv")
+    else:
+        (target / "REFERENCE.SV").write_text("forbidden\n", encoding="utf-8")
+    with pytest.raises(runner.RunnerError):
+        runner._create_input_snapshot_archive(
+            handoff,
+            tmp_path / "input.tar",
+            expected_manifest_sha256=expected_manifest,
+            expected_workspace_tree_sha256=expected_workspace,
+        )
+
+
+def test_private_snapshot_rejects_oversized_payload(tmp_path: Path, monkeypatch):
+    handoff = _make_handoff(tmp_path / "handoff")
+    monkeypatch.setattr(runner, "DEFAULT_MAX_RUN_INPUT_BYTES", 1)
+    with pytest.raises(runner.RunnerError, match="exceeds"):
+        runner._create_input_snapshot_archive(
+            handoff,
+            tmp_path / "input.tar",
+            expected_manifest_sha256=runner.sha256_file(
+                handoff / "candidate_manifest.jsonl"
+            ),
+            expected_workspace_tree_sha256=runner.sha256_workspace_tree(
+                handoff / "workspace"
+            ),
+        )
+    assert not (tmp_path / "input.tar").exists()
+
+
+def test_private_snapshot_detects_file_replacement_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    handoff = _make_handoff(tmp_path / "handoff")
+    candidate = handoff / "workspace" / "candidate" / "candidate.sv"
+    expected_manifest = runner.sha256_file(handoff / "candidate_manifest.jsonl")
+    expected_workspace = runner.sha256_workspace_tree(handoff / "workspace")
+    real_open_snapshot = runner._open_snapshot_file
+    replaced = False
+
+    def racing_open(input_root, relative):
+        nonlocal replaced
+        if relative == "workspace/candidate/candidate.sv" and not replaced:
+            candidate.unlink()
+            candidate.symlink_to(handoff / "candidate_manifest.jsonl")
+            replaced = True
+        return real_open_snapshot(input_root, relative)
+
+    monkeypatch.setattr(runner, "_open_snapshot_file", racing_open)
+    with pytest.raises(runner.RunnerError):
+        runner._create_input_snapshot_archive(
+            handoff,
+            tmp_path / "input.tar",
+            expected_manifest_sha256=expected_manifest,
+            expected_workspace_tree_sha256=expected_workspace,
+        )
+
+
+def test_named_volume_helpers_are_fixed_and_candidate_has_no_host_input_path(
+    tmp_path: Path,
+):
+    volume = "rtlbench-input-" + "1" * 32
+    output = tmp_path / "output"
+    for profile, runtime in (
+        (runner.PROFILE_PILOT_DOCKER, "docker"),
+        (runner.PROFILE_PRODUCTION_ROOTLESS, "podman"),
+    ):
+        config = runner.load_config(profile=profile)
+        candidate = runner.build_run_command(runtime, IMAGE, volume, output, config)
+        population = runner._build_population_command(runtime, IMAGE, volume, config)
+        probe = runner._build_probe_command(runtime, IMAGE, volume, config)
+        canonical_input = tmp_path / "canonical-private-handoff"
+        assert any(f"src={volume}" in item for item in candidate)
+        assert any(f"src={volume}" in item for item in population)
+        assert any(f"src={volume}" in item for item in probe)
+        assert str(canonical_input) not in " ".join(candidate)
+        assert "dst=/input" in candidate[candidate.index("--mount") + 1]
+        assert "volume-nocopy" in candidate[candidate.index("--mount") + 1]
+        assert ("readonly" if profile == runner.PROFILE_PILOT_DOCKER else "ro") in candidate[candidate.index("--mount") + 1]
+        assert candidate[candidate.index("--user") + 1] == "65532:65532"
+        assert population[population.index("--user") + 1] == "0:0"
+        assert probe[probe.index("--user") + 1] == "65532:65532"
+        for command in (population, probe):
+            assert not any(item.startswith("type=bind") for item in command)
+            assert "--network" in command and command[command.index("--network") + 1] == "none"
+            assert "--read-only" in command
+            assert command[command.index("--cap-drop") + 1] == "ALL"
+            assert "no-new-privileges" in command
+            assert "sh" not in command and "bash" not in command
+            assert "/usr/local/bin/python" in command
+
+
+def test_runtime_stages_restrictive_handoff_before_candidate_and_cleans_volume(
+    tmp_path: Path,
+):
+    handoff = _make_handoff(tmp_path / "handoff")
+    original_modes = _restrict_handoff_modes(handoff)
+    fake_docker, log = _fake_docker(tmp_path, mode="passing")
+    output = tmp_path / "evidence.jsonl"
+    runner.run_isolated(
+        image=IMAGE,
+        input_root=handoff,
+        output=output,
+        profile=runner.PROFILE_PILOT_DOCKER,
+        acknowledge_rootful_runtime=True,
+        runtime=str(fake_docker),
+    )
+    records = json.loads(log.read_text(encoding="utf-8"))
+    volume_create = next(item["argv"] for item in records if item["argv"][:2] == ["volume", "create"])
+    volume_name = volume_create[-1]
+    assert runner.INPUT_VOLUME_NAME_RE.fullmatch(volume_name)
+    assert next(item["argv"] for item in records if item["argv"][:2] == ["volume", "inspect"])
+    runs = [item["argv"] for item in records if item["argv"][:1] == ["run"]]
+    assert len(runs) == 3
+    population, probe, candidate = runs
+    assert population[population.index("--user") + 1] == "0:0"
+    assert probe[probe.index("--user") + 1] == "65532:65532"
+    assert candidate[candidate.index("--user") + 1] == "65532:65532"
+    assert population[population.index("--entrypoint") + 1] == "/usr/local/bin/python"
+    assert probe[probe.index("--entrypoint") + 1] == "/usr/local/bin/python"
+    assert probe[probe.index("-c") + 1] == runner.PROBE_INPUT_VOLUME_PROGRAM
+    probe_record = next(
+        item
+        for item in records
+        if item["argv"] == probe
+    )
+    assert probe_record["probe_program"] == runner.PROBE_INPUT_VOLUME_PROGRAM
+    assert json.loads(probe_record["probe_output"]) == {
+        "manifest_sha256": runner.sha256_file(
+            handoff / "candidate_manifest.jsonl"
+        ),
+        "workspace_tree_sha256": runner.sha256_workspace_tree(
+            handoff / "workspace"
+        ),
+    }
+    candidate_input_mount = next(
+        item[1]
+        for item in zip(candidate, candidate[1:])
+        if item[0] == "--mount" and "dst=/input" in item[1]
+    )
+    assert candidate_input_mount == (
+        f"type=volume,src={volume_name},dst=/input,readonly,volume-nocopy"
+    )
+    assert str(handoff) not in candidate
+    assert next(
+        item["argv"] for item in reversed(records) if item["argv"][:2] == ["volume", "rm"]
+    )[-1] == volume_name
+    assert not list((tmp_path / "fake-volumes").iterdir())
+    assert {path: stat.S_IMODE(path.stat().st_mode) for path in [handoff, *sorted(handoff.rglob("*"))]} == original_modes
+
+
+@pytest.mark.parametrize(
+    ("mode", "message"),
+    [
+        (
+            "probe_manifest_mismatch",
+            "staged manifest hash does not match canonical handoff hash",
+        ),
+        (
+            "probe_workspace_mismatch",
+            "staged workspace-tree hash does not match canonical handoff hash",
+        ),
+        (
+            "probe_both_mismatch",
+            "staged manifest and workspace-tree hashes do not match canonical handoff hashes",
+        ),
+        (
+            "probe_malformed",
+            "runtime-user input probe returned malformed output",
+        ),
+        (
+            "probe_unexpected",
+            "runtime-user input probe returned unexpected output",
+        ),
+        (
+            "probe_excessive",
+            "runtime-user input probe produced excessive output",
+        ),
+        (
+            "probe_failure",
+            "runtime-user input probe failed with status 1",
+        ),
+    ],
+)
+def test_candidate_does_not_start_when_runtime_probe_is_invalid(
+    tmp_path: Path, mode: str, message: str
+):
+    handoff = _make_handoff(tmp_path / "handoff")
+    fake_docker, log = _fake_docker(tmp_path, mode=mode)
+    output = tmp_path / "evidence.jsonl"
+    with pytest.raises(runner.RunnerError, match=re.escape(message)):
+        runner.run_isolated(
+            image=IMAGE,
+            input_root=handoff,
+            output=output,
+            profile=runner.PROFILE_PILOT_DOCKER,
+            acknowledge_rootful_runtime=True,
+            runtime=str(fake_docker),
+        )
+    assert not output.exists()
+    records = json.loads(log.read_text(encoding="utf-8"))
+    assert not any(
+        item["argv"][:1] == ["run"]
+        and item["argv"][item["argv"].index("--entrypoint") + 1] == "rtlbench"
+        for item in records
+    )
+    assert not list((tmp_path / "fake-volumes").iterdir())
+
+
+@pytest.mark.parametrize(
+    ("mode", "wall_timeout"),
+    [
+        ("populate_failure", None),
+        ("probe_failure", None),
+        ("startup_failure", None),
+        ("diagnostic", None),
+        ("timeout_diagnostic", 0.2),
+        ("invalid", None),
+        ("extra", None),
+    ],
+)
+def test_managed_volume_is_removed_on_each_runtime_failure(
+    tmp_path: Path, mode: str, wall_timeout: float | None
+):
+    handoff = _make_handoff(tmp_path / "handoff")
+    fake_docker, _ = _fake_docker(tmp_path, mode=mode)
+    output = tmp_path / "evidence.jsonl"
+    with pytest.raises(runner.RunnerError):
+        runner.run_isolated(
+            image=IMAGE,
+            input_root=handoff,
+            output=output,
+            profile=runner.PROFILE_PILOT_DOCKER,
+            acknowledge_rootful_runtime=True,
+            runtime=str(fake_docker),
+            wall_timeout=wall_timeout,
+        )
+    assert not output.exists()
+    assert not Path(str(output) + ".runner.json").exists()
+    assert not list((tmp_path / "fake-volumes").iterdir())
+
+
+def test_volume_cleanup_failure_fails_closed_before_publication(tmp_path: Path):
+    handoff = _make_handoff(tmp_path / "handoff")
+    fake_docker, _ = _fake_docker(tmp_path, mode="volume_remove_failure")
+    output = tmp_path / "evidence.jsonl"
+    with pytest.raises(runner.RunnerError, match="could not remove temporary input volume"):
+        runner.run_isolated(
+            image=IMAGE,
+            input_root=handoff,
+            output=output,
+            profile=runner.PROFILE_PILOT_DOCKER,
+            acknowledge_rootful_runtime=True,
+            runtime=str(fake_docker),
+        )
+    assert not output.exists()
+    assert not Path(str(output) + ".runner.json").exists()
 
 
 def test_local_docker_image_id_is_published_as_distinct_identity(
@@ -1517,10 +2116,11 @@ def test_readme_requires_output_outside_input_handoff():
 
 def test_runner_applies_security_boundary_and_no_reference_rtl(tmp_path: Path):
     config = runner.load_config()
+    input_volume = "rtlbench-input-" + "d" * 32
     command = runner.build_run_command(
         "/usr/bin/podman",
         IMAGE,
-        tmp_path / "input",
+        input_volume,
         tmp_path / "output",
         config,
     )
@@ -1531,7 +2131,8 @@ def test_runner_applies_security_boundary_and_no_reference_rtl(tmp_path: Path):
     assert "--read-only" in command
     assert "--user" in command and command[command.index("--user") + 1] == "65532:65532"
     assert "--pids-limit" in command
-    assert sum(value.startswith("type=bind") for value in command) == 2
+    assert sum(value.startswith("type=bind") for value in command) == 1
+    assert sum(value.startswith("type=volume") for value in command) == 1
     assert not any(value.startswith("-v") for value in command)
 
     handoff = _make_handoff(tmp_path / "handoff")
@@ -1725,6 +2326,7 @@ def test_partial_evidence_is_preserved(tmp_path: Path):
     assert "partial runtime diagnostic" not in result.identity_output.read_text(
         encoding="utf-8"
     )
+    assert not list((tmp_path / "fake-volumes").iterdir())
 
 
 def test_invalid_or_extra_runtime_output_is_not_published(tmp_path: Path):
@@ -1818,8 +2420,9 @@ def test_rootless_image_acceptance_matrix(tmp_path: Path):
         "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8"
     )
     before = _tree_hashes(handoff)
+    input_volume = "rtlbench-input-" + "e" * 32
     assert "--pull=never" in runner.build_run_command(
-        "podman", image, handoff, tmp_path, runner.load_config()
+        "podman", image, input_volume, tmp_path, runner.load_config()
     )
     output = tmp_path / "candidate_evidence.jsonl"
     result = runner.run_isolated(image=image, input_root=handoff, output=output)
@@ -1891,13 +2494,46 @@ def test_docker_pilot_image_acceptance_matrix(tmp_path: Path):
         "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
         encoding="utf-8",
     )
+    restrictive_modes = _restrict_handoff_modes(handoff)
     before = _tree_hashes(handoff)
     output = tmp_path / "isolated-output" / "candidate_evidence.jsonl"
     output.parent.mkdir()
 
     config = runner.load_config(profile=runner.PROFILE_PILOT_DOCKER)
+    input_volume = "rtlbench-input-" + "f" * 32
+    existing_volumes = subprocess.run(
+        [
+            "docker",
+            "volume",
+            "ls",
+            "-q",
+            "--filter",
+            f"label={runner.INPUT_VOLUME_LABEL}={runner.INPUT_VOLUME_LABEL_VALUE}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if existing_volumes.returncode != 0:
+        pytest.fail(f"Docker volume listing failed: {existing_volumes.stderr}")
+    existing_volume_names = set(existing_volumes.stdout.split())
+    created_volume = subprocess.run(
+        [
+            "docker",
+            "volume",
+            "create",
+            "--label",
+            f"{runner.INPUT_VOLUME_LABEL}={runner.INPUT_VOLUME_LABEL_VALUE}",
+            input_volume,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if created_volume.returncode != 0 or created_volume.stdout.strip() != input_volume:
+        pytest.fail(f"Docker input-volume setup failed: {created_volume.stderr}")
     create_command = runner.build_run_command(
-        "docker", image, handoff, output.parent, config
+        "docker", image, input_volume, output.parent, config
     )
     create_command[1] = "create"
     created = subprocess.run(
@@ -1937,6 +2573,8 @@ def test_docker_pilot_image_acceptance_matrix(tmp_path: Path):
         )
         mounts = {mount["Destination"]: mount for mount in container["Mounts"]}
         assert mounts["/input"]["RW"] is False
+        assert mounts["/input"]["Type"] == "volume"
+        assert str(handoff.resolve()) not in mounts["/input"].get("Source", "")
         assert mounts["/output"]["RW"] is True
         assert host_config["Memory"] == 536870912
         assert host_config["MemorySwap"] == 536870912
@@ -1945,6 +2583,12 @@ def test_docker_pilot_image_acceptance_matrix(tmp_path: Path):
     finally:
         subprocess.run(
             ["docker", "rm", "-f", container_id],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        subprocess.run(
+            ["docker", "volume", "rm", input_volume],
             capture_output=True,
             text=True,
             check=False,
@@ -1981,4 +2625,23 @@ def test_docker_pilot_image_acceptance_matrix(tmp_path: Path):
     )
     assert sidecar["evidence_sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
     assert _tree_hashes(handoff) == before
+    assert {
+        path: stat.S_IMODE(path.stat().st_mode)
+        for path in [handoff, *sorted(handoff.rglob("*"))]
+    } == restrictive_modes
+    remaining_volumes = subprocess.run(
+        [
+            "docker",
+            "volume",
+            "ls",
+            "-q",
+            "--filter",
+            f"label={runner.INPUT_VOLUME_LABEL}={runner.INPUT_VOLUME_LABEL_VALUE}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert remaining_volumes.returncode == 0
+    assert set(remaining_volumes.stdout.split()) == existing_volume_names
     assert not any(path.name == "reference.sv" for path in handoff.rglob("*"))
