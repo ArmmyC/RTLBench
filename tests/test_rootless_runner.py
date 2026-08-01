@@ -316,6 +316,73 @@ def test_contradictory_evidence_is_rejected(tmp_path: Path, mutation):
 
 
 @pytest.mark.parametrize(
+    "simulation_reason", ["tool_unavailable", "compile_failure"]
+)
+def test_simulation_evidence_cannot_replace_a_failed_compile_leaf(
+    tmp_path: Path, simulation_reason: str
+):
+    row = copy.deepcopy(_evidence_for_category("passed"))
+    row["accepted"] = False
+    row["failure_category"] = "compile_failure"
+    row["checks"]["compile"]["candidate"] = {
+        "attempted": True,
+        "passed": True,
+        "reason": None,
+    }
+    row["checks"]["simulation"]["candidate_passes"] = {
+        "attempted": False,
+        "passed": None,
+        "reason": simulation_reason,
+    }
+    row["mismatch_summary"].update(
+        reported_counts=[], reported_sample_counts=[], maximum_count=None
+    )
+    path = tmp_path / f"simulation-only-{simulation_reason}.jsonl"
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    with pytest.raises(runner.RunnerError):
+        runner.validate_candidate_evidence_file(path, max_bytes=1_000_000)
+
+
+@pytest.mark.parametrize(
+    "simulation_reason",
+    [
+        "functional_mismatch",
+        "simulation_result_missing",
+        "simulation_failure",
+        "timeout",
+    ],
+)
+def test_simulation_derived_evidence_requires_successful_compile(
+    tmp_path: Path, simulation_reason: str
+):
+    row = copy.deepcopy(_evidence_for_category("passed"))
+    row["accepted"] = False
+    row["failure_category"] = (
+        "timeout" if simulation_reason == "timeout" else simulation_reason
+    )
+    row["checks"]["compile"]["candidate"] = {
+        "attempted": True,
+        "passed": False,
+        "reason": "compile_failure",
+    }
+    row["checks"]["simulation"]["candidate_passes"] = {
+        "attempted": True,
+        "passed": False,
+        "reason": simulation_reason,
+    }
+    row["mismatch_summary"].update(
+        reported_counts=[1] if simulation_reason == "functional_mismatch" else [],
+        reported_sample_counts=[1] if simulation_reason == "functional_mismatch" else [],
+        maximum_count=1 if simulation_reason == "functional_mismatch" else None,
+        timeout_reported=simulation_reason == "timeout",
+    )
+    path = tmp_path / f"compile-failed-{simulation_reason}.jsonl"
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    with pytest.raises(runner.RunnerError):
+        runner.validate_candidate_evidence_file(path, max_bytes=1_000_000)
+
+
+@pytest.mark.parametrize(
     "category",
     [
         "passed",
@@ -380,11 +447,11 @@ def test_build_rejects_false_rtlbench_commit_label():
         "--verilator-package-version",
         "5.006-3",
         "--verilator-version",
-        "Verilator 5.006",
+        "5.006",
         "--yosys-package-version",
         "0.23-6",
         "--yosys-version",
-        "Yosys 0.23",
+        "0.23",
     ]
     result = subprocess.run(command, capture_output=True, text=True, check=False)
     assert result.returncode != 0
@@ -398,9 +465,9 @@ def test_build_rejects_false_tool_version_labels():
         iverilog_version="11.0",
         vvp_version="11.0",
         verilator_package_version="5.006-3",
-        verilator_version="Verilator 5.006",
+        verilator_version="5.006",
         yosys_package_version="0.23-6",
-        yosys_version="Yosys 0.23",
+        yosys_version="0.23",
     )
     packages = {
         "iverilog": "11.0-1.1+b1",
@@ -409,7 +476,7 @@ def test_build_rejects_false_tool_version_labels():
     }
     tools = {
         "iverilog": "Icarus Verilog version 11.0",
-        "vvp": "vvp 11.0",
+        "vvp": "vvp version 11.0",
         "verilator": "Verilator 5.006",
         "yosys": "Yosys 0.23",
     }
@@ -427,6 +494,109 @@ def test_build_rejects_false_tool_version_labels():
             package_versions={**packages, "verilator": "5.005-1"},
             tool_outputs=tools,
         )
+
+
+@pytest.mark.parametrize(
+    ("parser", "output", "expected"),
+    [
+        (
+            build_identity.parse_iverilog_version,
+            "warning: surrounding text\nIcarus Verilog version 11.0 (stable)\n",
+            "11.0",
+        ),
+        (
+            build_identity.parse_vvp_version,
+            "vvp.tgt version 11.0 (stable) (v11_0)\n",
+            "11.0",
+        ),
+        (
+            build_identity.parse_verilator_version,
+            "Verilator 5.006 2023-01-01 rev v5.006\n",
+            "5.006",
+        ),
+        (
+            build_identity.parse_yosys_version,
+            "Yosys 0.23 (git sha1 abcdef)\n",
+            "0.23",
+        ),
+    ],
+)
+def test_tool_version_parsers_extract_exact_normalized_runtime_versions(
+    parser, output: str, expected: str
+):
+    assert parser(output) == expected
+
+
+def test_exact_tool_version_matching_rejects_substrings_and_bad_output():
+    with pytest.raises(build_identity.BuildIdentityError, match="runtime version mismatch"):
+        build_identity.validate_identity(
+            build_identity.ExpectedIdentity(
+                python_version="3.11.9",
+                iverilog_package_version="11.0-1.1+b1",
+                iverilog_version="1.0",
+                vvp_version="11.0",
+                verilator_package_version="5.006-3",
+                verilator_version="5.006",
+                yosys_package_version="0.23-6",
+                yosys_version="0.23",
+            ),
+            python_version="3.11.9",
+            package_versions={
+                "iverilog": "11.0-1.1+b1",
+                "verilator": "5.006-3",
+                "yosys": "0.23-6",
+            },
+            tool_outputs={
+                "iverilog": "Icarus Verilog version 11.0 (stable)",
+                "vvp": "vvp.tgt version 11.0 (stable)",
+                "verilator": "Verilator 5.006",
+                "yosys": "Yosys 0.23",
+            },
+        )
+
+    malformed = {
+        "iverilog": "Icarus Verilog release unknown",
+        "vvp": "vvp.tgt release unknown",
+        "verilator": "Verilator release unknown",
+        "yosys": "Yosys release unknown",
+    }
+    for name, output in malformed.items():
+        parser = getattr(build_identity, f"parse_{name}_version")
+        with pytest.raises(build_identity.BuildIdentityError):
+            parser(output)
+
+    with pytest.raises(build_identity.BuildIdentityError, match="conflicting"):
+        build_identity.parse_yosys_version(
+            "Yosys 0.23 (git sha1 abc)\nYosys 0.24 (git sha1 def)\n"
+        )
+
+
+def test_exact_tool_version_matching_accepts_all_normal_outputs():
+    expected = build_identity.ExpectedIdentity(
+        python_version="3.11.9",
+        iverilog_package_version="11.0-1.1+b1",
+        iverilog_version="11.0",
+        vvp_version="11.0",
+        verilator_package_version="5.006-3",
+        verilator_version="5.006",
+        yosys_package_version="0.23-6",
+        yosys_version="0.23",
+    )
+    build_identity.validate_identity(
+        expected,
+        python_version="3.11.9",
+        package_versions={
+            "iverilog": "11.0-1.1+b1",
+            "verilator": "5.006-3",
+            "yosys": "0.23-6",
+        },
+        tool_outputs={
+            "iverilog": "Icarus Verilog version 11.0 (stable)",
+            "vvp": "vvp.tgt version 11.0 (stable)",
+            "verilator": "Verilator 5.006 2023-01-01",
+            "yosys": "Yosys 0.23 (git sha1 abc)",
+        },
+    )
 
 
 def test_readme_requires_output_outside_input_handoff():

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import argparse
 import platform
+import re
 import subprocess
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 
 class BuildIdentityError(ValueError):
@@ -23,6 +24,56 @@ class ExpectedIdentity:
     verilator_version: str
     yosys_package_version: str
     yosys_version: str
+
+
+_VERSION_NUMBER = r"([0-9]+(?:\.[0-9]+)+)"
+
+
+def parse_iverilog_version(output: str) -> str:
+    return _parse_runtime_version(
+        output,
+        "iverilog",
+        rf"(?im)^[ \t]*Icarus[ \t]+Verilog[ \t]+version[ \t]+{_VERSION_NUMBER}(?=[ \t(\r\n]|$)",
+    )
+
+
+def parse_vvp_version(output: str) -> str:
+    return _parse_runtime_version(
+        output,
+        "vvp",
+        rf"(?im)^[ \t]*(?:vvp(?:\.tgt)?|Icarus[ \t]+Verilog[ \t]+runtime)[ \t]+version[ \t]+{_VERSION_NUMBER}(?=[ \t(\r\n]|$)",
+    )
+
+
+def parse_verilator_version(output: str) -> str:
+    return _parse_runtime_version(
+        output,
+        "verilator",
+        rf"(?im)^[ \t]*Verilator[ \t]+{_VERSION_NUMBER}(?=[ \t(\r\n]|$)",
+    )
+
+
+def parse_yosys_version(output: str) -> str:
+    return _parse_runtime_version(
+        output,
+        "yosys",
+        rf"(?im)^[ \t]*Yosys[ \t]+{_VERSION_NUMBER}(?=[ \t(\r\n]|$)",
+    )
+
+
+def _parse_runtime_version(output: str, tool: str, pattern: str) -> str:
+    if not isinstance(output, str):
+        raise BuildIdentityError(f"{tool} version output is not text")
+    versions = re.findall(pattern, output)
+    if not versions:
+        raise BuildIdentityError(f"{tool} version output format is unrecognized")
+    unique_versions = set(versions)
+    if len(unique_versions) != 1:
+        raise BuildIdentityError(
+            f"{tool} version output contains conflicting versions: "
+            f"{sorted(unique_versions)}"
+        )
+    return versions[0]
 
 
 def validate_identity(
@@ -48,6 +99,12 @@ def validate_identity(
             raise BuildIdentityError(
                 f"{name} package version mismatch: expected {required!r}, got {actual!r}"
             )
+    runtime_parsers: dict[str, Callable[[str], str]] = {
+        "iverilog": parse_iverilog_version,
+        "vvp": parse_vvp_version,
+        "verilator": parse_verilator_version,
+        "yosys": parse_yosys_version,
+    }
     tool_expectations = {
         "iverilog": expected.iverilog_version,
         "vvp": expected.vvp_version,
@@ -56,9 +113,12 @@ def validate_identity(
     }
     for name, required in tool_expectations.items():
         output = tool_outputs.get(name)
-        if not output or required not in output:
+        if output is None:
+            raise BuildIdentityError(f"{name} runtime version output is missing")
+        actual = runtime_parsers[name](output)
+        if actual != required:
             raise BuildIdentityError(
-                f"{name} runtime version mismatch: expected {required!r}"
+                f"{name} runtime version mismatch: expected {required!r}, got {actual!r}"
             )
 
 
