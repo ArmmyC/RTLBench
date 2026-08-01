@@ -144,6 +144,7 @@ docker run --pull never --rm --network none --user 65532:65532 --read-only
   --mount type=bind,src=<staged-output>,dst=/output
   --workdir /work
   --env HOME=/tmp --env TMPDIR=/tmp --env LANG=C --env LC_ALL=C
+  --env PYTHONPATH=/opt/rtlbench/src
   --env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
   --entrypoint rtlbench <digest-qualified-image>
   verify-candidates --manifest /input/candidate_manifest.jsonl
@@ -166,6 +167,13 @@ group on the outer timeout.
 The `/input` bind mount is explicitly read-only. The `/output` bind mount is
 writable by default because no read-only option is supplied. The `rw` options
 on `/tmp` and `/work` are tmpfs options and remain unchanged.
+
+Both the image and launcher pin module discovery to the immutable image source
+directory with `PYTHONPATH=/opt/rtlbench/src`. The launcher always supplies
+this fixed value and never takes it from the host or forwards arbitrary
+environment variables. The Dockerfile build smoke tests use the same minimal
+`env -i` environment as runtime and verify both the fixed wrapper and direct
+`rtlbench.cli` import.
 
 ## Evidence and publication
 

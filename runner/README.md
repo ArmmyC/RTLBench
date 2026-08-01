@@ -143,6 +143,13 @@ SSH keys, cloud credentials, production secrets, repository root as writable,
 or a Docker socket. The launcher forwards only its fixed sanitized environment
 and never reads Docker client configuration or registry credentials.
 
+Both the image and launcher pin module discovery to
+`PYTHONPATH=/opt/rtlbench/src`. This value is fixed to the immutable image
+source directory and is never copied from the host or treated as arbitrary
+environment forwarding. The image build smoke test uses the same minimal
+`env -i` environment as runtime and checks both the fixed entrypoint and direct
+`rtlbench.cli` module import.
+
 Final evidence is validated by RTLBench's strict
 `rtl_candidate_evidence_v0.1` validator before atomic publication. Partial
 evidence is preserved on a bounded timeout or runtime failure. The adjacent

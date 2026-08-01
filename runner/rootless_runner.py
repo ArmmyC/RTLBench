@@ -31,6 +31,15 @@ from rtlbench.candidate_evidence import (  # noqa: E402
 
 
 CONFIG_PATH = Path(__file__).with_name("runner_config.json")
+CONTAINER_PYTHONPATH = "/opt/rtlbench/src"
+CONTAINER_ENVIRONMENT = (
+    ("HOME", "/tmp"),
+    ("TMPDIR", "/tmp"),
+    ("LANG", "C"),
+    ("LC_ALL", "C"),
+    ("PYTHONPATH", CONTAINER_PYTHONPATH),
+    ("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+)
 MAX_RUNTIME_DIAGNOSTIC_BYTES = 65_536
 RUNTIME_DIAGNOSTIC_TRUNCATION_MARKER = (
     "[runtime diagnostic truncated to 65536 bytes]"
@@ -385,16 +394,11 @@ def build_run_command(
         f"type=bind,src={output_root},dst=/output",
         "--workdir",
         "/work",
-        "--env",
-        "HOME=/tmp",
-        "--env",
-        "TMPDIR=/tmp",
-        "--env",
-        "LANG=C",
-        "--env",
-        "LC_ALL=C",
-        "--env",
-        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        *[
+            argument
+            for name, value in CONTAINER_ENVIRONMENT
+            for argument in ("--env", f"{name}={value}")
+        ],
         "--entrypoint",
         "rtlbench",
         image,

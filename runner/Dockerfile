@@ -51,11 +51,27 @@ RUN groupadd --gid 65532 rtlbench \
     && chown 65532:65532 /tmp/home /work \
     && printf '%s\n' \
         '#!/bin/sh' \
-        'exec python -m rtlbench.cli "$@"' \
+        'exec /usr/local/bin/python -m rtlbench.cli "$@"' \
         > /usr/local/bin/rtlbench \
     && chmod 0555 /usr/local/bin/rtlbench \
-    && test "$(sed -n '2p' /usr/local/bin/rtlbench)" = 'exec python -m rtlbench.cli "$@"' \
-    && PYTHONPATH=/opt/rtlbench/src /usr/local/bin/rtlbench --help >/dev/null
+    && test "$(sed -n '2p' /usr/local/bin/rtlbench)" = 'exec /usr/local/bin/python -m rtlbench.cli "$@"' \
+    && env -i \
+        HOME=/tmp \
+        TMPDIR=/tmp \
+        LANG=C \
+        LC_ALL=C \
+        PYTHONPATH=/opt/rtlbench/src \
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        /usr/local/bin/rtlbench --help >/dev/null \
+    && env -i \
+        HOME=/tmp \
+        TMPDIR=/tmp \
+        LANG=C \
+        LC_ALL=C \
+        PYTHONPATH=/opt/rtlbench/src \
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        /usr/local/bin/python -c \
+        'import rtlbench.cli; assert rtlbench.cli.__file__.startswith("/opt/rtlbench/src/rtlbench/")'
 
 ENV HOME=/tmp/home \
     TMPDIR=/tmp \

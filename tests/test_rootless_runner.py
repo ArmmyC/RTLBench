@@ -179,7 +179,19 @@ def _fake_runtime(
         args = sys.argv[1:]
         log = Path({str(log)!r})
         record = json.loads(log.read_text()) if log.exists() else []
-        record.append({{"argv": args, "secret_present": "FAKE_HOST_SECRET" in os.environ}})
+        container_env = {{
+            item.split("=", 1)[0]: item.split("=", 1)[1]
+            for index, value in enumerate(args[:-1])
+            if value == "--env" and "=" in args[index + 1]
+            for item in [args[index + 1]]
+        }}
+        record.append({{
+            "argv": args,
+            "secret_present": "FAKE_HOST_SECRET" in os.environ,
+            "test_secret_present": "RTLBench_TEST_SECRET" in os.environ,
+            "observed_pythonpath": os.environ.get("PYTHONPATH"),
+            "container_env": container_env,
+        }})
         log.write_text(json.dumps(record), encoding="utf-8")
         if {backend!r} == "podman" and args[:1] == ["info"]:
             print("true")
@@ -603,6 +615,26 @@ def _bind_mounts(command: list[str]) -> dict[str, str]:
     }
 
 
+def _container_env(command: list[str]) -> dict[str, str]:
+    values = [
+        command[index + 1]
+        for index, item in enumerate(command[:-1])
+        if item == "--env"
+    ]
+    assert len(values) == len(set(value.split("=", 1)[0] for value in values))
+    return dict(value.split("=", 1) for value in values)
+
+
+EXPECTED_CONTAINER_ENVIRONMENT = {
+    "HOME": "/tmp",
+    "TMPDIR": "/tmp",
+    "LANG": "C",
+    "LC_ALL": "C",
+    "PYTHONPATH": "/opt/rtlbench/src",
+    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+}
+
+
 def test_docker_pilot_command_is_fixed_and_bounded(tmp_path: Path):
     config = runner.load_config(profile=runner.PROFILE_PILOT_DOCKER)
     input_root = tmp_path / "input"
@@ -628,6 +660,8 @@ def test_docker_pilot_command_is_fixed_and_bounded(tmp_path: Path):
     assert value("--memory") == "536870912"
     assert value("--memory-swap") == "536870912"
     assert value("--pids-limit") == "64"
+    assert _container_env(command) == EXPECTED_CONTAINER_ENVIRONMENT
+    assert command.count("--env") == len(EXPECTED_CONTAINER_ENVIRONMENT)
     assert "fsize=33554432:33554432" in command
     assert "nofile=256:256" in command
     assert "nproc=64:64" in command
@@ -653,6 +687,51 @@ def test_docker_pilot_command_is_fixed_and_bounded(tmp_path: Path):
         "--volumes-from",
     }
     assert not forbidden.intersection(command)
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [runner.PROFILE_PILOT_DOCKER, runner.PROFILE_PRODUCTION_ROOTLESS],
+)
+def test_both_profiles_use_the_same_fixed_container_environment(
+    tmp_path: Path, profile: str
+):
+    command = runner.build_run_command(
+        "docker" if profile == runner.PROFILE_PILOT_DOCKER else "podman",
+        IMAGE,
+        tmp_path / "input",
+        tmp_path / "output",
+        runner.load_config(profile=profile),
+    )
+    assert _container_env(command) == EXPECTED_CONTAINER_ENVIRONMENT
+    assert command.count("PYTHONPATH=/opt/rtlbench/src") == 1
+
+
+def test_host_pythonpath_and_environment_secrets_are_not_forwarded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    handoff = _make_handoff(tmp_path / "handoff")
+    fake_docker, log = _fake_docker(tmp_path, mode="passing")
+    output = tmp_path / "evidence.jsonl"
+    monkeypatch.setenv("PYTHONPATH", "/host/private/path")
+    monkeypatch.setenv("RTLBench_TEST_SECRET", "must-not-cross-boundary")
+
+    runner.run_isolated(
+        image=IMAGE,
+        input_root=handoff,
+        output=output,
+        profile=runner.PROFILE_PILOT_DOCKER,
+        acknowledge_rootful_runtime=True,
+        runtime=str(fake_docker),
+    )
+
+    record = json.loads(log.read_text(encoding="utf-8"))[-1]
+    assert record["container_env"] == EXPECTED_CONTAINER_ENVIRONMENT
+    assert record["observed_pythonpath"] is None
+    assert record["secret_present"] is False
+    assert record["test_secret_present"] is False
+    assert "/host/private/path" not in json.dumps(record)
+    assert "must-not-cross-boundary" not in json.dumps(record)
 
 
 def test_writable_output_mount_uses_portable_default_syntax(tmp_path: Path):
@@ -1091,9 +1170,13 @@ def test_dockerfile_wrapper_and_build_identity_checks_are_explicit():
     dockerfile = (Path(__file__).parents[1] / "runner" / "Dockerfile").read_text(
         encoding="utf-8"
     )
-    assert "'exec python -m rtlbench.cli \"$@\"'" in dockerfile
+    assert "'exec /usr/local/bin/python -m rtlbench.cli \"$@\"'" in dockerfile
+    assert "'exec python -m rtlbench.cli \"$@\"'" not in dockerfile
+    assert "ENTRYPOINT [\"rtlbench\"]" in dockerfile
+    assert "COPY src /opt/rtlbench/src" in dockerfile
     assert "test \"$(sed -n '2p' /usr/local/bin/rtlbench)\"" in dockerfile
-    assert "PYTHONPATH=/opt/rtlbench/src /usr/local/bin/rtlbench --help >/dev/null" in dockerfile
+    assert "env -i \\\n        HOME=/tmp \\\n        TMPDIR=/tmp \\\n        LANG=C \\\n        LC_ALL=C \\\n        PYTHONPATH=/opt/rtlbench/src \\\n        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \\\n        /usr/local/bin/rtlbench --help >/dev/null" in dockerfile
+    assert "/usr/local/bin/python -c \\\n        'import rtlbench.cli; assert rtlbench.cli.__file__.startswith(\"/opt/rtlbench/src/rtlbench/\")'" in dockerfile
 
 
 def test_built_cli_help_succeeds():
@@ -1812,6 +1895,13 @@ def test_docker_pilot_image_acceptance_matrix(tmp_path: Path):
         container = json.loads(inspected.stdout)[0]
         host_config = container["HostConfig"]
         assert container["Config"]["User"] == "65532:65532"
+        container_environment = container["Config"]["Env"]
+        assert "PYTHONPATH=/opt/rtlbench/src" in container_environment
+        assert all(
+            value == "PYTHONPATH=/opt/rtlbench/src"
+            for value in container_environment
+            if value.startswith("PYTHONPATH=")
+        )
         assert host_config["NetworkMode"] == "none"
         assert host_config["ReadonlyRootfs"] is True
         assert "ALL" in host_config["CapDrop"]
