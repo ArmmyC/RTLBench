@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -30,6 +31,13 @@ from rtlbench.candidate_evidence import (  # noqa: E402
 
 
 CONFIG_PATH = Path(__file__).with_name("runner_config.json")
+MAX_RUNTIME_DIAGNOSTIC_BYTES = 65_536
+RUNTIME_DIAGNOSTIC_TRUNCATION_MARKER = (
+    "[runtime diagnostic truncated to 65536 bytes]"
+)
+_ANSI_ESCAPE_RE = re.compile(
+    r"(?:\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[()][0-2A-Z])"
+)
 PROFILE_PILOT_DOCKER = "pilot-docker"
 PROFILE_PRODUCTION_ROOTLESS = "production-rootless"
 PROFILES = frozenset({PROFILE_PILOT_DOCKER, PROFILE_PRODUCTION_ROOTLESS})
@@ -122,6 +130,105 @@ class RunResult:
     partial_output: Path | None
     identity_output: Path | None
     timed_out: bool
+
+
+@dataclass(frozen=True)
+class ExecutionResult:
+    returncode: int
+    timed_out: bool
+    diagnostic_output: str
+    diagnostic_truncated: bool
+
+
+class _DiagnosticTail:
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._buffer = bytearray()
+        self.truncated = False
+
+    def append(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        if len(chunk) >= self._limit:
+            discarded_previous = bool(self._buffer)
+            self._buffer = bytearray(chunk[-self._limit :])
+            self.truncated = (
+                self.truncated or discarded_previous or len(chunk) > self._limit
+            )
+            return
+        overflow = len(self._buffer) + len(chunk) - self._limit
+        if overflow > 0:
+            del self._buffer[:overflow]
+            self.truncated = True
+        self._buffer.extend(chunk)
+
+    def bytes(self) -> bytes:
+        return bytes(self._buffer)
+
+
+def _drain_runtime_output(stream: Any, tail: _DiagnosticTail) -> None:
+    """Drain a runtime pipe without retaining more than the bounded tail."""
+    try:
+        while True:
+            chunk = stream.read(8192)
+            if not chunk:
+                return
+            tail.append(chunk)
+    except (OSError, ValueError):
+        return
+
+
+def _sanitize_runtime_diagnostic(
+    diagnostic: str, *, replacements: Mapping[str, str]
+) -> tuple[str, bool]:
+    """Remove terminal/control data and launcher-owned host paths."""
+    normalized = diagnostic.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = _ANSI_ESCAPE_RE.sub("", normalized).replace("\x00", "")
+    normalized = "".join(
+        character
+        for character in normalized
+        if character in {"\n", "\t"} or ord(character) >= 32
+    )
+    for source, replacement in sorted(
+        ((source, replacement) for source, replacement in replacements.items() if source),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        normalized = normalized.replace(source, replacement)
+    encoded = normalized.encode("utf-8", errors="replace")
+    if len(encoded) <= MAX_RUNTIME_DIAGNOSTIC_BYTES:
+        return normalized, False
+    return (
+        encoded[-MAX_RUNTIME_DIAGNOSTIC_BYTES :].decode("utf-8", errors="replace"),
+        True,
+    )
+
+
+def _runtime_diagnostic_replacements(
+    *,
+    input_root: Path,
+    output: Path,
+    staging: Path,
+    runtime_environment: Path,
+) -> dict[str, str]:
+    """Return stable placeholders for paths owned by this launcher."""
+    return {
+        str(input_root.resolve()): "<input>",
+        str(output.resolve()): "<output>",
+        str(staging.resolve()): "<staging>",
+        str(runtime_environment.resolve()): "<runtime-environment>",
+        str(Path(tempfile.gettempdir()).resolve()): "<temporary>",
+    }
+
+
+def _format_runtime_diagnostic(diagnostic: str, truncated: bool) -> str:
+    if diagnostic:
+        result = f":\n{diagnostic}"
+    else:
+        result = "; no runtime diagnostic output"
+    if truncated:
+        result += f"\n{RUNTIME_DIAGNOSTIC_TRUNCATION_MARKER}"
+    return result
 
 
 def load_config(
@@ -363,11 +470,18 @@ def run_isolated(
             staged_output = Path(output_tmp)
             staged_output.chmod(0o777)
             command = build_run_command(runtime_path, image, input_root, staged_output, config)
-            returncode, timed_out = _execute(
+            runtime_environment = Path(env_tmp)
+            execution = _execute(
                 command,
                 timeout=timeout,
                 environment=_runtime_environment(
-                    Path(env_tmp), include_runtime_dir=config.rootless
+                    runtime_environment, include_runtime_dir=config.rootless
+                ),
+                diagnostic_replacements=_runtime_diagnostic_replacements(
+                    input_root=input_root,
+                    output=output,
+                    staging=staged_output,
+                    runtime_environment=runtime_environment,
                 ),
             )
             _reject_unexpected_output(staged_output, config)
@@ -378,10 +492,20 @@ def run_isolated(
             if final_exists:
                 validate_candidate_evidence_file(final, max_bytes=config.evidence_bytes)
             if not final_exists and not partial_exists:
-                if timed_out:
-                    raise RunnerError("runner wall timeout expired without preserved evidence")
+                if execution.timed_out:
+                    raise RunnerError(
+                        "runner wall timeout expired without preserved evidence"
+                        + _format_runtime_diagnostic(
+                            execution.diagnostic_output,
+                            execution.diagnostic_truncated,
+                        )
+                    )
                 raise RunnerError(
-                    f"isolated RTLBench exited with status {returncode} without evidence"
+                    f"isolated RTLBench exited with status {execution.returncode} without evidence"
+                    + _format_runtime_diagnostic(
+                        execution.diagnostic_output,
+                        execution.diagnostic_truncated,
+                    )
                 )
             if sha256_file(manifest_path) != manifest_sha256:
                 raise RunnerError("input manifest changed during isolated execution")
@@ -403,11 +527,11 @@ def run_isolated(
                 identity["partial_evidence_sha256"] = sha256_file(partial_destination)
             _publish_json(identity_destination, identity)
             result = RunResult(
-                returncode=124 if timed_out else returncode,
+                returncode=124 if execution.timed_out else execution.returncode,
                 evidence_output=output if final_exists else None,
                 partial_output=partial_destination if partial_exists else None,
                 identity_output=identity_destination,
-                timed_out=timed_out,
+                timed_out=execution.timed_out,
             )
     return result
 
@@ -590,25 +714,73 @@ def _read_image_identity(runtime: str, image: str, config: RunnerConfig) -> dict
 
 
 def _execute(
-    command: Sequence[str], *, timeout: float, environment: Mapping[str, str]
-) -> tuple[int, bool]:
+    command: Sequence[str],
+    *,
+    timeout: float,
+    environment: Mapping[str, str],
+    diagnostic_replacements: Mapping[str, str] | None = None,
+) -> ExecutionResult:
+    replacements = diagnostic_replacements or {}
     try:
         process = subprocess.Popen(
             list(command),
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             start_new_session=True,
             env=dict(environment),
         )
     except OSError as exc:
-        raise RunnerError(f"could not start isolated RTLBench: {exc}") from exc
-    try:
-        returncode = process.wait(timeout=timeout)
-        return returncode, False
-    except subprocess.TimeoutExpired:
+        diagnostic, truncated = _sanitize_runtime_diagnostic(
+            str(exc), replacements=replacements
+        )
+        raise RunnerError(
+            "could not start isolated RTLBench"
+            + _format_runtime_diagnostic(diagnostic, truncated)
+        ) from exc
+    if process.stdout is None:
         _terminate_process_group(process)
-        return 124, True
+        raise RunnerError("isolated RTLBench runtime did not provide a diagnostic pipe")
+    tail = _DiagnosticTail(MAX_RUNTIME_DIAGNOSTIC_BYTES)
+    reader = threading.Thread(
+        target=_drain_runtime_output,
+        args=(process.stdout, tail),
+        name="rtlbench-runtime-diagnostic",
+        daemon=True,
+    )
+    reader.start()
+    timed_out = False
+    try:
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _terminate_process_group(process)
+            returncode = 124
+            timed_out = True
+    finally:
+        reader.join(timeout=5.0)
+        if reader.is_alive():
+            try:
+                process.stdout.close()
+            except (OSError, ValueError):
+                pass
+            reader.join(timeout=5.0)
+        if reader.is_alive():
+            raise RunnerError("isolated RTLBench diagnostic reader did not terminate")
+        try:
+            process.stdout.close()
+        except (OSError, ValueError):
+            pass
+    diagnostic, sanitized_truncated = _sanitize_runtime_diagnostic(
+        tail.bytes().decode("utf-8", errors="replace"),
+        replacements=replacements,
+    )
+    return ExecutionResult(
+        returncode=returncode,
+        timed_out=timed_out,
+        diagnostic_output=diagnostic,
+        diagnostic_truncated=tail.truncated or sanitized_truncated,
+    )
 
 
 def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:

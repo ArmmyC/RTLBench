@@ -155,6 +155,13 @@ local-image run uses `image_identity_kind: local-image-id` with
 `image_identity_kind: repository-digest`. It contains no
 timestamps, hostnames, usernames, host paths, or secret paths.
 
+The launcher continuously drains top-level container-runtime output so a
+startup traceback cannot block the runtime process. It retains only a fixed
+65,536-byte diagnostic tail, sanitizes it before display, and shows it only
+for launcher/runtime failures. This is not a complete container log. Runtime
+diagnostics are never written to candidate evidence or the identity sidecar,
+and successful executions do not print captured runtime output.
+
 The execution sequence is:
 
 ```text

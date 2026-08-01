@@ -173,6 +173,7 @@ def _fake_runtime(
         import json
         import os
         import sys
+        import time
         from pathlib import Path
 
         args = sys.argv[1:]
@@ -205,7 +206,36 @@ def _fake_runtime(
             (input_root / "candidate_manifest.jsonl").write_text(
                 "mutated by fake runtime\\n", encoding="utf-8"
             )
+        if {mode!r} == "diagnostic":
+            print("synthetic stdout marker", flush=True)
+            print("synthetic container traceback", file=sys.stderr, flush=True)
+            raise SystemExit(1)
+        if {mode!r} == "large_diagnostic":
+            os.write(1, b"diagnostic prefix\\n")
+            os.write(2, b"x" * 70000)
+            os.write(1, b"final failure marker\\n")
+            raise SystemExit(1)
+        if {mode!r} == "timeout_diagnostic":
+            print("synthetic timeout marker", flush=True)
+            time.sleep(30)
+            raise SystemExit(1)
+        if {mode!r} == "sanitize_diagnostic":
+            print("input path: " + str(input_root), flush=True)
+            print("output path: " + str(output_root), flush=True)
+            print("environment path: " + os.environ.get("HOME", ""), flush=True)
+            print(
+                "temporary path: "
+                + str(Path(os.environ.get("TMPDIR", "")).parent),
+                flush=True,
+            )
+            print("secret: " + os.environ.get("FAKE_HOST_SECRET", "<missing>"), flush=True)
+            print("escape: " + chr(27) + "[31mred" + chr(27) + "[0m", flush=True)
+            os.write(1, b"nul\\x00marker\\n")
+            raise SystemExit(1)
+        if {mode!r} == "passing_diagnostic":
+            print("success diagnostic should not be surfaced", file=sys.stderr, flush=True)
         if {mode!r} == "partial":
+            print("partial runtime diagnostic", file=sys.stderr, flush=True)
             (output_root / "candidate_evidence.jsonl.rtlbench-partial").write_text("partial row\\n", encoding="utf-8")
             raise SystemExit(124)
         if {mode!r} == "invalid":
@@ -222,6 +252,7 @@ def _fake_runtime(
             "internal_error": ("internal_error", False),
             "simulation_failure": ("simulation_failure", False),
             "mutate": ("passed", True),
+            "passing_diagnostic": ("passed", True),
         }}
         category, accepted = categories[{mode!r}]
         row = {synthetic_row}
@@ -232,6 +263,40 @@ def _fake_runtime(
     script.write_text(body.lstrip(), encoding="utf-8")
     script.chmod(script.stat().st_mode | stat.S_IXUSR)
     return script, log
+
+
+def _direct_fake_execution(
+    tmp_path: Path, *, mode: str, timeout: float = 5.0
+) -> runner.ExecutionResult:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    handoff = _make_handoff(tmp_path / "handoff")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    output = tmp_path / "published" / "candidate_evidence.jsonl"
+    output.parent.mkdir()
+    runtime_environment = tmp_path / "runtime-environment"
+    fake_runtime, _ = _fake_docker(tmp_path, mode=mode)
+    command = [
+        str(fake_runtime),
+        "run",
+        "--mount",
+        f"type=bind,src={handoff},dst=/input,readonly",
+        "--mount",
+        f"type=bind,src={staging},dst=/output",
+    ]
+    return runner._execute(
+        command,
+        timeout=timeout,
+        environment=runner._runtime_environment(
+            runtime_environment, include_runtime_dir=False
+        ),
+        diagnostic_replacements=runner._runtime_diagnostic_replacements(
+            input_root=handoff,
+            output=output,
+            staging=staging,
+            runtime_environment=runtime_environment,
+        ),
+    )
 
 
 def _builder_arguments(commit: str) -> list[str]:
@@ -1392,6 +1457,144 @@ def test_evidence_validator_accepts_rtlbench_verifier_output(
     assert len(rows) == 3
 
 
+def test_runtime_stderr_is_surfaced_for_no_evidence_failure(tmp_path: Path):
+    handoff = _make_handoff(tmp_path / "handoff")
+    fake_docker, _ = _fake_docker(tmp_path, mode="diagnostic")
+    with pytest.raises(runner.RunnerError) as error:
+        runner.run_isolated(
+            image=IMAGE,
+            input_root=handoff,
+            output=tmp_path / "evidence.jsonl",
+            profile=runner.PROFILE_PILOT_DOCKER,
+            acknowledge_rootful_runtime=True,
+            runtime=str(fake_docker),
+        )
+    message = str(error.value)
+    assert "status 1" in message
+    assert "synthetic stdout marker" in message
+    assert "synthetic container traceback" in message
+
+
+def test_runtime_stdout_and_stderr_are_combined(tmp_path: Path):
+    execution = _direct_fake_execution(tmp_path, mode="diagnostic")
+    assert execution.returncode == 1
+    assert execution.timed_out is False
+    assert "synthetic stdout marker" in execution.diagnostic_output
+    assert "synthetic container traceback" in execution.diagnostic_output
+
+
+def test_runtime_diagnostic_is_bounded_and_retains_tail(tmp_path: Path):
+    execution = _direct_fake_execution(tmp_path, mode="large_diagnostic")
+    assert execution.returncode == 1
+    assert execution.diagnostic_truncated is True
+    assert (
+        len(execution.diagnostic_output.encode("utf-8"))
+        <= runner.MAX_RUNTIME_DIAGNOSTIC_BYTES
+    )
+    assert "final failure marker" in execution.diagnostic_output
+
+    handoff = _make_handoff(tmp_path / "formatted-handoff")
+    formatted_root = tmp_path / "formatted"
+    formatted_root.mkdir()
+    fake_docker, _ = _fake_docker(formatted_root, mode="large_diagnostic")
+    with pytest.raises(runner.RunnerError) as error:
+        runner.run_isolated(
+            image=IMAGE,
+            input_root=handoff,
+            output=tmp_path / "formatted-evidence.jsonl",
+            profile=runner.PROFILE_PILOT_DOCKER,
+            acknowledge_rootful_runtime=True,
+            runtime=str(fake_docker),
+        )
+    assert runner.RUNTIME_DIAGNOSTIC_TRUNCATION_MARKER in str(error.value)
+
+
+def test_timeout_runtime_diagnostic_is_bounded_and_surfaced(tmp_path: Path):
+    execution = _direct_fake_execution(
+        tmp_path / "direct", mode="timeout_diagnostic", timeout=0.2
+    )
+    assert execution.returncode == 124
+    assert execution.timed_out is True
+    assert "synthetic timeout marker" in execution.diagnostic_output
+    assert (
+        len(execution.diagnostic_output.encode("utf-8"))
+        <= runner.MAX_RUNTIME_DIAGNOSTIC_BYTES
+    )
+
+    handoff = _make_handoff(tmp_path / "formatted-handoff")
+    formatted_root = tmp_path / "formatted"
+    formatted_root.mkdir()
+    fake_docker, _ = _fake_docker(formatted_root, mode="timeout_diagnostic")
+    with pytest.raises(runner.RunnerError) as error:
+        runner.run_isolated(
+            image=IMAGE,
+            input_root=handoff,
+            output=tmp_path / "formatted-evidence.jsonl",
+            profile=runner.PROFILE_PILOT_DOCKER,
+            acknowledge_rootful_runtime=True,
+            runtime=str(fake_docker),
+            wall_timeout=0.2,
+        )
+    message = str(error.value)
+    assert "runner wall timeout expired without preserved evidence" in message
+    assert "synthetic timeout marker" in message
+
+
+def test_runtime_diagnostic_is_sanitized(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    handoff = _make_handoff(tmp_path / "handoff")
+    fake_docker, _ = _fake_docker(tmp_path, mode="sanitize_diagnostic")
+    output = tmp_path / "published" / "evidence.jsonl"
+    output.parent.mkdir()
+    temp_root = tmp_path / "tmp"
+    temp_root.mkdir()
+    monkeypatch.setattr(runner.tempfile, "tempdir", str(temp_root))
+    monkeypatch.setenv("FAKE_HOST_SECRET", "must-not-cross-boundary")
+
+    with pytest.raises(runner.RunnerError) as error:
+        runner.run_isolated(
+            image=IMAGE,
+            input_root=handoff,
+            output=output,
+            profile=runner.PROFILE_PILOT_DOCKER,
+            acknowledge_rootful_runtime=True,
+            runtime=str(fake_docker),
+        )
+    message = str(error.value)
+    assert str(handoff.resolve()) not in message
+    assert str(output.resolve()) not in message
+    assert "<input>" in message
+    assert "<staging>" in message
+    assert "<runtime-environment>" in message
+    assert "<temporary>" in message
+    assert "must-not-cross-boundary" not in message
+    assert "\x00" not in message
+    assert "\x1b" not in message
+
+
+def test_successful_evidence_does_not_publish_runtime_diagnostic(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    handoff = _make_handoff(tmp_path / "handoff")
+    fake_docker, _ = _fake_docker(tmp_path, mode="passing_diagnostic")
+    output = tmp_path / "evidence.jsonl"
+    runner.run_isolated(
+        image=IMAGE,
+        input_root=handoff,
+        output=output,
+        profile=runner.PROFILE_PILOT_DOCKER,
+        acknowledge_rootful_runtime=True,
+        runtime=str(fake_docker),
+    )
+    sidecar_text = Path(str(output) + ".runner.json").read_text(encoding="utf-8")
+    evidence_text = output.read_text(encoding="utf-8")
+    assert "success diagnostic should not be surfaced" not in evidence_text
+    assert "success diagnostic should not be surfaced" not in sidecar_text
+    assert "diagnostic_output" not in sidecar_text
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
 def test_partial_evidence_is_preserved(tmp_path: Path):
     handoff = _make_handoff(tmp_path / "handoff")
     fake_podman, _ = _fake_podman(tmp_path, mode="partial")
@@ -1407,6 +1610,12 @@ def test_partial_evidence_is_preserved(tmp_path: Path):
     assert result.partial_output == Path(str(output) + ".rtlbench-partial")
     assert result.partial_output.read_text(encoding="utf-8") == "partial row\n"
     assert not output.exists()
+    assert "partial runtime diagnostic" not in result.partial_output.read_text(
+        encoding="utf-8"
+    )
+    assert "partial runtime diagnostic" not in result.identity_output.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_invalid_or_extra_runtime_output_is_not_published(tmp_path: Path):

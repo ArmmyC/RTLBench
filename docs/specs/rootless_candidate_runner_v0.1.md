@@ -223,6 +223,14 @@ For `production-rootless`, the corresponding identity is
 and `rootless: true`. The sidecar accompanies, but does not replace,
 RTLBench's candidate-evidence contract.
 
+The launcher continuously drains top-level container-runtime output and keeps
+only a fixed 65,536-byte diagnostic tail. Before a launcher/runtime failure is
+reported, the retained output is sanitized for control sequences and
+launcher-owned host paths. It is not a complete container log. Diagnostics are
+shown only for launcher/runtime failures and are never written to candidate
+evidence or the identity sidecar; successful executions do not print captured
+runtime output.
+
 For a Docker local-image run, the identity fields are instead:
 
 ```json
