@@ -13,20 +13,53 @@ There is no automatic Docker/Podman fallback and no implicit profile choice in
 the primary CLI. `runner/run_rootless.py` remains a compatibility wrapper that
 always selects `production-rootless`.
 
-## Immutable image
+## Build an immutable local image
 
-Both profiles use the same immutable image format. Build the image from a
-digest-qualified base with exact package and executable versions, then use its
-repository digest—not a mutable tag—as the execution reference:
+Use the primary builder with an explicit backend. The Docker builder requires
+only ordinary Docker; it does not probe or fall back to Podman. The
+digest-qualified base image must already be local, and the build uses
+`--pull=never`:
 
-```text
-localhost/rtlbench-runner@sha256:<64-lowercase-hex-digest>
+```bash
+runner/build_isolated_image.sh \
+  --builder docker \
+  --base-image python:3.11-slim@sha256:<local-base-digest> \
+  --tag rtlbench-runner:pilot \
+  --rtlbench-commit "$(git rev-parse HEAD)" \
+  --python-version <exact-python-version> \
+  --iverilog-package-version <exact-iverilog-package-version> \
+  --iverilog-version <exact-iverilog-runtime-version> \
+  --vvp-version <exact-vvp-runtime-version> \
+  --verilator-package-version <exact-verilator-package-version> \
+  --verilator-version <exact-verilator-runtime-version> \
+  --yosys-package-version <exact-yosys-package-version> \
+  --yosys-version <exact-yosys-runtime-version>
 ```
 
-The image must contain the fixed `rtlbench` entrypoint, non-root user
-`65532:65532`, verified RTLBench/tool-version labels, and the working CLI help
-smoke test. Candidate execution does not need network access after the image
-has been imported or pulled.
+The builder prints the immutable local image ID. For a Docker-only local
+pilot, pass that ID to the launcher:
+
+```text
+sha256:<64-lowercase-hex-image-id>
+```
+
+The compatibility `runner/build_rootless_image.sh` wrapper always selects
+`--builder podman-rootless`; that backend requires Podman `rootless=true`.
+Both builders use the same `runner/Dockerfile`, require a clean checkout
+whose requested commit equals `HEAD`, verify exact package and runtime
+versions, and require the base image to be present locally.
+
+For production-rootless, use a repository digest rather than the local image
+ID:
+
+```text
+localhost/rtlbench-runner@sha256:<64-lowercase-hex-repository-digest>
+```
+
+Tags remain invalid for both profiles. The image must contain the fixed
+`rtlbench` entrypoint, non-root user `65532:65532`, verified
+RTLBench/tool-version labels, and the working CLI help smoke test. Candidate
+execution does not pull images or require network access.
 
 ## Local pilot
 
@@ -38,7 +71,7 @@ separate from the read-only handoff:
 python runner/run_isolated.py \
   --profile pilot-docker \
   --acknowledge-rootful-runtime \
-  --image localhost/rtlbench-runner@sha256:<immutable-image-digest> \
+  --image sha256:<local-image-id> \
   --input /path/to/attempt_01 \
   --output /path/to/isolated-output/candidate_evidence.jsonl
 ```
@@ -74,7 +107,7 @@ Use rootless Podman explicitly on shared or production systems:
 ```bash
 python runner/run_isolated.py \
   --profile production-rootless \
-  --image localhost/rtlbench-runner@sha256:<immutable-image-digest> \
+  --image localhost/rtlbench-runner@sha256:<immutable-repository-digest> \
   --input /path/to/attempt_01 \
   --output /path/to/isolated-output/candidate_evidence.jsonl
 ```
@@ -107,8 +140,12 @@ Final evidence is validated by RTLBench's strict
 `rtl_candidate_evidence_v0.1` validator before atomic publication. Partial
 evidence is preserved on a bounded timeout or runtime failure. The adjacent
 `candidate_evidence.jsonl.runner.json` sidecar records the profile/runtime
-mode, image and tool identity, resource policy, manifest hash, deterministic
-workspace-tree hash, and final/partial evidence hashes. It contains no
+mode, image identity kind, supplied image, inspected local image ID, repository
+digest when present, tool identity, resource policy, manifest hash,
+deterministic workspace-tree hash, and final/partial evidence hashes. A Docker
+local-image run uses `image_identity_kind: local-image-id` with
+`image_digest: null`; a repository digest uses
+`image_identity_kind: repository-digest`. It contains no
 timestamps, hostnames, usernames, host paths, or secret paths.
 
 The execution sequence is:

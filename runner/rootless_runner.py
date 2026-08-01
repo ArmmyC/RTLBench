@@ -1,4 +1,4 @@
-"""Fail-closed rootless Podman launcher for RTLBench candidate verification."""
+"""Fail-closed profile-aware launcher for RTLBench candidate verification."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ CONFIG_PATH = Path(__file__).with_name("runner_config.json")
 PROFILE_PILOT_DOCKER = "pilot-docker"
 PROFILE_PRODUCTION_ROOTLESS = "production-rootless"
 PROFILES = frozenset({PROFILE_PILOT_DOCKER, PROFILE_PRODUCTION_ROOTLESS})
-IDENTITY_SCHEMA_VERSION = "rtlbench_runner_identity_v0.1"
+IDENTITY_SCHEMA_VERSION = "rtlbench_runner_identity_v0.2"
 EXPECTED_PROFILE_LIMITS = {
     PROFILE_PRODUCTION_ROOTLESS: {
         "cpus": 2.0,
@@ -60,7 +60,9 @@ EXPECTED_PROFILE_LIMITS = {
         "evidence_bytes": 33554432,
     },
 }
-IMAGE_DIGEST_RE = re.compile(r"^.+@sha256:[0-9a-f]{64}$")
+REPOSITORY_IMAGE_DIGEST_RE = re.compile(r"^.+@sha256:[0-9a-f]{64}$")
+LOCAL_IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+IMAGE_DIGEST_RE = REPOSITORY_IMAGE_DIGEST_RE
 GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 EXPECTED_INNER_COMMAND = (
     "rtlbench",
@@ -233,9 +235,15 @@ def build_run_command(
     config: RunnerConfig,
 ) -> list[str]:
     """Build the only container command this runner permits."""
+    pull_args = (
+        ["--pull=never"]
+        if config.profile == PROFILE_PRODUCTION_ROOTLESS
+        else ["--pull", "never"]
+    )
     command = [
         runtime,
         "run",
+        *pull_args,
         "--rm",
         "--network",
         "none",
@@ -314,7 +322,7 @@ def run_isolated(
     _validate_profile_selection(profile, acknowledge_rootful_runtime)
     config = load_config(config_path, profile=profile)
     runtime_path = _validate_runtime(runtime, config)
-    image = _validate_image(image)
+    image = _validate_image(image, config)
     input_root = _validate_input_root(input_root)
     output = _validate_host_output(output, input_root, config, force_output)
     _validate_no_reference_rtl(input_root)
@@ -428,7 +436,7 @@ def _validate_runtime(runtime: str | None, config: RunnerConfig) -> str:
     runtime = runtime or config.runtime_name
     runtime_path = shutil.which(runtime)
     if runtime_path is None:
-        raise RunnerError(f"{config.runtime_name} runtime was not found")
+        raise RunnerError(f"{config.profile} container runtime executable was not found")
     if Path(runtime_path).name != config.runtime_name:
         raise RunnerError(
             f"{config.profile} requires the {config.runtime_name} runtime executable"
@@ -440,7 +448,7 @@ def _validate_runtime(runtime: str | None, config: RunnerConfig) -> str:
             environment=_runtime_environment(None, include_runtime_dir=True),
         )
         if result.returncode != 0 or result.stdout.strip().lower() != "true":
-            raise RunnerError("podman must report rootless=true")
+            raise RunnerError("production-rootless requires Podman rootless=true")
     else:
         result = _run_checked(
             [runtime_path, "version", "--format", "{{json .Server.Version}}"],
@@ -448,7 +456,7 @@ def _validate_runtime(runtime: str | None, config: RunnerConfig) -> str:
             environment=_runtime_environment(None, include_runtime_dir=False),
         )
         if result.returncode != 0:
-            raise RunnerError("docker runtime is not usable")
+            raise RunnerError("pilot-docker Docker container runtime is not usable")
         try:
             version = json.loads(result.stdout.strip())
         except json.JSONDecodeError as exc:
@@ -458,9 +466,20 @@ def _validate_runtime(runtime: str | None, config: RunnerConfig) -> str:
     return runtime_path
 
 
-def _validate_image(image: str) -> str:
-    if not IMAGE_DIGEST_RE.fullmatch(image):
-        raise RunnerError("image must be referenced by name@sha256:<64 hex digits>")
+def _validate_image(image: str, config: RunnerConfig | None = None) -> str:
+    config = config or load_config()
+    if config.profile == PROFILE_PRODUCTION_ROOTLESS:
+        if not REPOSITORY_IMAGE_DIGEST_RE.fullmatch(image):
+            raise RunnerError(
+                "production-rootless image must be referenced by name@sha256:<64 hex digits>"
+            )
+    elif not (
+        LOCAL_IMAGE_ID_RE.fullmatch(image)
+        or REPOSITORY_IMAGE_DIGEST_RE.fullmatch(image)
+    ):
+        raise RunnerError(
+            "pilot-docker image must be a local sha256:<64 hex image ID or name@sha256:<64 hex digest>"
+        )
     return image
 
 
@@ -518,19 +537,34 @@ def _validate_host_output(
 
 
 def _read_image_identity(runtime: str, image: str, config: RunnerConfig) -> dict[str, Any]:
-    result = _run_checked(
+    image_id_result = _run_checked(
+        [runtime, "image", "inspect", "--format", "{{.Id}}", image],
+        timeout=10.0,
+        environment=_runtime_environment(None, include_runtime_dir=config.rootless),
+    )
+    if image_id_result.returncode != 0:
+        raise RunnerError("could not inspect the immutable RTLBench image")
+    image_id_lines = image_id_result.stdout.strip().splitlines()
+    if len(image_id_lines) != 1 or not LOCAL_IMAGE_ID_RE.fullmatch(image_id_lines[0]):
+        raise RunnerError("RTLBench image inspection did not return one valid local image ID")
+    image_id = image_id_lines[0]
+    if LOCAL_IMAGE_ID_RE.fullmatch(image) and image_id != image:
+        raise RunnerError("supplied local image ID does not match the inspected image ID")
+
+    labels_result = _run_checked(
         [runtime, "image", "inspect", "--format", "{{json .Config.Labels}}", image],
         timeout=10.0,
         environment=_runtime_environment(None, include_runtime_dir=config.rootless),
     )
-    if result.returncode != 0:
+    if labels_result.returncode != 0:
         raise RunnerError("could not inspect the immutable RTLBench image")
     try:
-        labels = json.loads(result.stdout.strip())
+        labels = json.loads(labels_result.stdout.strip())
     except json.JSONDecodeError as exc:
         raise RunnerError("RTLBench image labels are not valid JSON") from exc
     if not isinstance(labels, dict):
         raise RunnerError("RTLBench image labels are missing")
+    local_image = LOCAL_IMAGE_ID_RE.fullmatch(image) is not None
     identity: dict[str, Any] = {
         "schema_version": IDENTITY_SCHEMA_VERSION,
         "profile": config.profile,
@@ -538,8 +572,10 @@ def _read_image_identity(runtime: str, image: str, config: RunnerConfig) -> dict
         "runtime_mode": config.runtime_mode,
         "rootless": config.rootless,
         "runner_config_version": config.version,
+        "image_identity_kind": "local-image-id" if local_image else "repository-digest",
         "image": image,
-        "image_digest": image.split("@", 1)[1],
+        "image_id": image_id,
+        "image_digest": None if local_image else image.split("@", 1)[1],
     }
     for identity_name, label_name in IDENTITY_LABELS.items():
         value = labels.get(label_name)
@@ -566,7 +602,7 @@ def _execute(
             env=dict(environment),
         )
     except OSError as exc:
-        raise RunnerError(f"could not start rootless RTLBench: {exc}") from exc
+        raise RunnerError(f"could not start isolated RTLBench: {exc}") from exc
     try:
         returncode = process.wait(timeout=timeout)
         return returncode, False
@@ -636,7 +672,7 @@ def _run_checked(
             env=dict(environment),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RunnerError(f"rootless runtime probe failed: {exc}") from exc
+        raise RunnerError(f"container runtime probe failed: {exc}") from exc
 
 
 def _reject_unexpected_output(staged_output: Path, config: RunnerConfig) -> None:
@@ -697,7 +733,11 @@ def _build_parser(*, require_profile: bool = False, allow_profile: bool = True) 
             choices=sorted(PROFILES),
             help="isolation profile",
         )
-    parser.add_argument("--image", required=True, help="immutable IMAGE@sha256:<digest>")
+    parser.add_argument(
+        "--image",
+        required=True,
+        help="immutable IMAGE@sha256:<digest> or pilot sha256:<local-image-id>",
+    )
     parser.add_argument("--input", type=Path, required=True, help="read-only candidate handoff")
     parser.add_argument("--output", type=Path, required=True, help="host evidence JSONL output")
     parser.add_argument("--acknowledge-rootful-runtime", action="store_true")
@@ -732,11 +772,11 @@ def main(
             config_path=args.config,
         )
     except RunnerError as exc:
-        print(f"rtlbench rootless runner: {exc}", file=os.sys.stderr)
+        print(f"isolated RTLBench runner: {exc}", file=os.sys.stderr)
         return 125
     if result.timed_out:
         print(
-            "rtlbench rootless runner: wall timeout; preserved partial evidence",
+            "isolated RTLBench runner: wall timeout; preserved partial evidence",
             file=os.sys.stderr,
         )
         return 124

@@ -29,14 +29,47 @@ verified Python, Icarus/vvp, Verilator, and Yosys labels
 working CLI help smoke test
 ```
 
-The launcher accepts only:
+The production launcher accepts only:
 
 ```text
 repository/name@sha256:<64 lowercase hexadecimal characters>
 ```
 
-Tags and unqualified names are rejected. The image can be imported or pulled
-before execution; candidate execution itself runs without network access.
+A bare tag is rejected in both profiles. For the explicitly acknowledged
+`pilot-docker` profile, the launcher also accepts this immutable local Docker
+image ID form:
+
+```text
+sha256:<64 lowercase hexadecimal characters>
+```
+
+The local image ID is inspected, must match exactly, and is the value passed
+to `docker run`; it is not resolved from a mutable tag. Candidate execution
+never pulls an image.
+
+Build the image with the primary explicit-backend builder. The base image must
+already be local and both builders use the same Dockerfile:
+
+```bash
+runner/build_isolated_image.sh \
+  --builder docker \
+  --base-image python:3.11-slim@sha256:<local-base-digest> \
+  --tag rtlbench-runner:pilot \
+  --rtlbench-commit "$(git rev-parse HEAD)" \
+  --python-version <version> \
+  --iverilog-package-version <version> \
+  --iverilog-version <version> \
+  --vvp-version <version> \
+  --verilator-package-version <version> \
+  --verilator-version <version> \
+  --yosys-package-version <version> \
+  --yosys-version <version>
+```
+
+`--builder podman-rootless` is the other explicit choice and requires
+`rootless=true`; `build_rootless_image.sh` remains a compatibility wrapper
+that always selects it. The builder requires a clean checkout, exact
+`HEAD`/commit identity, and `--pull=never`.
 
 ## Profiles and CLI
 
@@ -78,7 +111,8 @@ must return exactly `true` after normalization. The command runs as
 filesystem, read-only `/input`, dropped capabilities,
 `no-new-privileges`, bounded `/work` and `/tmp`, and bounded CPU, memory,
 process, file, output, and wall-clock resources. This is the stronger profile
-for shared or production systems.
+for shared or production systems. Its fixed runtime command includes
+`podman run --pull=never`; the Docker profile uses `docker run --pull never`.
 
 ### pilot-docker
 
@@ -97,7 +131,7 @@ production-approved.
 The fixed Docker command is equivalent to:
 
 ```text
-docker run --rm --network none --user 65532:65532 --read-only
+docker run --pull never --rm --network none --user 65532:65532 --read-only
   --cap-drop ALL --security-opt no-new-privileges
   --cpus 1 --memory 536870912 --memory-swap 536870912
   --pids-limit 64 --ulimit fsize=33554432:33554432
@@ -153,12 +187,14 @@ directory, or credential path. Its identity fields include:
 
 ```json
 {
-  "schema_version": "rtlbench_runner_identity_v0.1",
+  "schema_version": "rtlbench_runner_identity_v0.2",
   "profile": "pilot-docker",
   "runtime": "docker",
   "runtime_mode": "rootful-daemon",
   "rootless": false,
+  "image_identity_kind": "repository-digest",
   "image": "name@sha256:<digest>",
+  "image_id": "sha256:<inspected-local-image-id>",
   "image_digest": "sha256:<digest>",
   "rtlbench_commit": "<40-hex-sha>",
   "runner_config_version": "<version>",
@@ -180,6 +216,17 @@ For `production-rootless`, the corresponding identity is
 `profile: production-rootless`, `runtime: podman`, `runtime_mode: rootless`,
 and `rootless: true`. The sidecar accompanies, but does not replace,
 RTLBench's candidate-evidence contract.
+
+For a Docker local-image run, the identity fields are instead:
+
+```json
+{
+  "image_identity_kind": "local-image-id",
+  "image": "sha256:<image-id>",
+  "image_id": "sha256:<image-id>",
+  "image_digest": null
+}
+```
 
 ## Acceptance and operating sequence
 

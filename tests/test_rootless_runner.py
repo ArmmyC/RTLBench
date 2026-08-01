@@ -17,6 +17,8 @@ import rtlbench.candidate_verification as verification
 
 
 IMAGE = "registry.example/rtlbench-runner@sha256:" + "a" * 64
+LOCAL_IMAGE_ID = "sha256:" + "b" * 64
+INSPECTED_IMAGE_ID = LOCAL_IMAGE_ID
 LABELS = {
     "org.opencontainers.image.revision": "0" * 40,
     "io.rtlbench.runner.config_version": "rtlbench_rootless_runner_v0.1",
@@ -161,6 +163,9 @@ def _fake_runtime(
         "internal_error": "internal_error",
         "simulation_failure": "simulation_failure",
     }
+    inspected_image_id = (
+        "sha256:" + "c" * 64 if mode == "id_mismatch" else INSPECTED_IMAGE_ID
+    )
     synthetic_row = repr(_evidence_for_category(synthetic_categories.get(mode, "passed")))
     body = textwrap.dedent(
         f"""
@@ -182,6 +187,11 @@ def _fake_runtime(
             print(json.dumps("26.1.0"))
             raise SystemExit(0)
         if args[:2] == ["image", "inspect"]:
+            if {mode!r} == "missing_image":
+                raise SystemExit(1)
+            if "{{{{.Id}}}}" in args:
+                print({inspected_image_id!r})
+                raise SystemExit(0)
             print(json.dumps({LABELS!r}))
             raise SystemExit(0)
         if args[:1] != ["run"]:
@@ -222,6 +232,97 @@ def _fake_runtime(
     script.write_text(body.lstrip(), encoding="utf-8")
     script.chmod(script.stat().st_mode | stat.S_IXUSR)
     return script, log
+
+
+def _builder_arguments(commit: str) -> list[str]:
+    return [
+        "--base-image",
+        "python:3.11-slim@sha256:" + "a" * 64,
+        "--tag",
+        "rtlbench-runner:pilot",
+        "--rtlbench-commit",
+        commit,
+        "--python-version",
+        "3.11.9",
+        "--iverilog-package-version",
+        "11.0-1.1+b1",
+        "--iverilog-version",
+        "11.0",
+        "--vvp-version",
+        "11.0",
+        "--verilator-package-version",
+        "5.006-3",
+        "--verilator-version",
+        "5.006",
+        "--yosys-package-version",
+        "0.23-6",
+        "--yosys-version",
+        "0.23",
+    ]
+
+
+def _write_fake_executable(path: Path, source: str) -> None:
+    path.write_text(source, encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+def _fake_builder_tools(tmp_path: Path, commit: str) -> tuple[Path, Path, Path]:
+    bin_root = tmp_path / "bin"
+    bin_root.mkdir()
+    git_source = textwrap.dedent(
+        f"""
+        #!{sys.executable}
+        import sys
+        if sys.argv[1:] == ["rev-parse", "HEAD"]:
+            print({commit!r})
+        elif sys.argv[1:] == ["status", "--porcelain"]:
+            pass
+        else:
+            raise SystemExit(2)
+        """
+    )
+    _write_fake_executable(bin_root / "git", git_source.lstrip())
+    docker_log = tmp_path / "docker-builder.json"
+    docker_source = textwrap.dedent(
+        f"""
+        #!{sys.executable}
+        import json
+        import sys
+        from pathlib import Path
+        args = sys.argv[1:]
+        log = Path({str(docker_log)!r})
+        rows = json.loads(log.read_text()) if log.exists() else []
+        rows.append(args)
+        log.write_text(json.dumps(rows), encoding="utf-8")
+        if args[:2] == ["version", "--format"]:
+            print(json.dumps("26.1.0"))
+        elif args[:2] == ["image", "inspect"]:
+            if "--format" in args:
+                print("sha256:" + "d" * 64)
+        elif args[:1] == ["build"]:
+            pass
+        else:
+            raise SystemExit(2)
+        """
+    )
+    _write_fake_executable(bin_root / "docker", docker_source.lstrip())
+    podman_log = tmp_path / "podman-builder.json"
+    podman_source = textwrap.dedent(
+        f"""
+        #!{sys.executable}
+        import json
+        import sys
+        from pathlib import Path
+        log = Path({str(podman_log)!r})
+        log.write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
+        if sys.argv[1:2] == ["info"]:
+            print("false")
+        else:
+            raise SystemExit(2)
+        """
+    )
+    _write_fake_executable(bin_root / "podman", podman_source.lstrip())
+    return bin_root, docker_log, podman_log
 
 
 @pytest.mark.parametrize(
@@ -289,6 +390,8 @@ def test_synthetic_runner_outcomes_preserve_evidence_and_input(
         "runtime_mode": config.runtime_mode,
         "evidence_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
         "image": IMAGE,
+        "image_id": INSPECTED_IMAGE_ID,
+        "image_identity_kind": "repository-digest",
         "image_digest": "sha256:" + "a" * 64,
         "iverilog_version": LABELS["io.rtlbench.iverilog_version"],
         "manifest_sha256": hashlib.sha256(
@@ -321,6 +424,11 @@ def test_synthetic_runner_outcomes_preserve_evidence_and_input(
     assert not list((tmp_path / "tmp").glob(".rtlbench-runner-*"))
     record = json.loads(log.read_text())
     assert record[-1]["secret_present"] is False
+    run_argv = next(item["argv"] for item in reversed(record) if item["argv"][:1] == ["run"])
+    if backend == "docker":
+        assert ["--pull", "never"] == run_argv[1:3]
+    else:
+        assert run_argv[1] == "--pull=never"
 
 
 def test_wrapper_forwards_every_argument_unchanged(
@@ -422,6 +530,7 @@ def test_docker_pilot_command_is_fixed_and_bounded(tmp_path: Path):
         return command[command.index(option) + 1]
 
     assert value("--network") == "none"
+    assert value("--pull") == "never"
     assert value("--user") == "65532:65532"
     assert "--read-only" in command
     assert value("--cap-drop") == "ALL"
@@ -456,6 +565,126 @@ def test_docker_pilot_command_is_fixed_and_bounded(tmp_path: Path):
         "--volumes-from",
     }
     assert not forbidden.intersection(command)
+
+
+def test_local_docker_image_id_is_published_as_distinct_identity(
+    tmp_path: Path,
+):
+    handoff = _make_handoff(tmp_path / "handoff")
+    fake_docker, _ = _fake_docker(tmp_path)
+    output = tmp_path / "evidence.jsonl"
+    runner.run_isolated(
+        image=LOCAL_IMAGE_ID,
+        input_root=handoff,
+        output=output,
+        profile=runner.PROFILE_PILOT_DOCKER,
+        acknowledge_rootful_runtime=True,
+        runtime=str(fake_docker),
+    )
+    sidecar = json.loads(Path(str(output) + ".runner.json").read_text())
+    assert sidecar["schema_version"] == "rtlbench_runner_identity_v0.2"
+    assert sidecar["image_identity_kind"] == "local-image-id"
+    assert sidecar["image"] == LOCAL_IMAGE_ID
+    assert sidecar["image_id"] == LOCAL_IMAGE_ID
+    assert sidecar["image_digest"] is None
+
+
+def test_local_docker_image_id_must_match_inspection(tmp_path: Path):
+    handoff = _make_handoff(tmp_path / "handoff")
+    fake_docker, log = _fake_runtime(tmp_path, mode="id_mismatch", backend="docker")
+    with pytest.raises(runner.RunnerError, match="does not match"):
+        runner.run_isolated(
+            image=LOCAL_IMAGE_ID,
+            input_root=handoff,
+            output=tmp_path / "evidence.jsonl",
+            profile=runner.PROFILE_PILOT_DOCKER,
+            acknowledge_rootful_runtime=True,
+            runtime=str(fake_docker),
+        )
+    assert not any(item["argv"][:1] == ["run"] for item in json.loads(log.read_text()))
+
+
+@pytest.mark.parametrize(
+    ("profile", "backend", "image", "acknowledge", "message"),
+    [
+        (
+            runner.PROFILE_PRODUCTION_ROOTLESS,
+            "podman",
+            LOCAL_IMAGE_ID,
+            False,
+            "production-rootless",
+        ),
+        (
+            runner.PROFILE_PRODUCTION_ROOTLESS,
+            "podman",
+            "rtlbench-runner:latest",
+            False,
+            "production-rootless",
+        ),
+        (
+            runner.PROFILE_PILOT_DOCKER,
+            "docker",
+            "rtlbench-runner:latest",
+            True,
+            "pilot-docker",
+        ),
+    ],
+)
+def test_mutable_or_profile_incompatible_image_rejected(
+    tmp_path: Path,
+    profile: str,
+    backend: str,
+    image: str,
+    acknowledge: bool,
+    message: str,
+):
+    handoff = _make_handoff(tmp_path / "handoff")
+    fake_runtime, log = _fake_runtime(tmp_path, mode="passing", backend=backend)
+    with pytest.raises(runner.RunnerError, match=message):
+        runner.run_isolated(
+            image=image,
+            input_root=handoff,
+            output=tmp_path / "evidence.jsonl",
+            profile=profile,
+            acknowledge_rootful_runtime=acknowledge,
+            runtime=str(fake_runtime),
+        )
+    assert not any(item["argv"][:1] == ["run"] for item in json.loads(log.read_text()))
+
+
+def test_missing_local_image_fails_before_container_run(tmp_path: Path):
+    handoff = _make_handoff(tmp_path / "handoff")
+    fake_docker, log = _fake_runtime(tmp_path, mode="missing_image", backend="docker")
+    with pytest.raises(runner.RunnerError, match="inspect the immutable"):
+        runner.run_isolated(
+            image=LOCAL_IMAGE_ID,
+            input_root=handoff,
+            output=tmp_path / "evidence.jsonl",
+            profile=runner.PROFILE_PILOT_DOCKER,
+            acknowledge_rootful_runtime=True,
+            runtime=str(fake_docker),
+        )
+    assert not any(item["argv"][:1] == ["run"] for item in json.loads(log.read_text()))
+
+
+def test_pull_policy_is_not_a_user_overridable_argument():
+    parser = runner._build_parser(require_profile=True)
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--profile",
+                runner.PROFILE_PILOT_DOCKER,
+                "--acknowledge-rootful-runtime",
+                "--image",
+                LOCAL_IMAGE_ID,
+                "--input",
+                "/input",
+                "--output",
+                "/output/evidence.jsonl",
+                "--pull",
+                "always",
+            ]
+        )
 
 
 @pytest.mark.parametrize(
@@ -802,6 +1031,89 @@ def test_build_rejects_false_rtlbench_commit_label():
     assert "does not match the checked-out source HEAD" in result.stderr
 
 
+def test_docker_builder_does_not_require_podman(tmp_path: Path):
+    commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], text=True
+    ).strip()
+    bin_root, docker_log, podman_log = _fake_builder_tools(tmp_path, commit)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{bin_root}:/usr/bin:/bin"
+    result = subprocess.run(
+        [
+            "bash",
+            "runner/build_isolated_image.sh",
+            "--builder",
+            "docker",
+            *_builder_arguments(commit),
+        ],
+        cwd=Path(__file__).parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "built local image ID: sha256:" + "d" * 64 in result.stdout
+    assert not podman_log.exists()
+    build_rows = json.loads(docker_log.read_text())
+    build_argv = next(row for row in build_rows if row[:1] == ["build"])
+    assert "--pull=never" in build_argv
+    assert "--file" in build_argv
+    assert build_argv[build_argv.index("--file") + 1] == "runner/Dockerfile"
+
+
+def test_podman_builder_rejects_rootful_podman(tmp_path: Path):
+    commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], text=True
+    ).strip()
+    bin_root, docker_log, podman_log = _fake_builder_tools(tmp_path, commit)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{bin_root}:/usr/bin:/bin"
+    result = subprocess.run(
+        [
+            "bash",
+            "runner/build_isolated_image.sh",
+            "--builder",
+            "podman-rootless",
+            *_builder_arguments(commit),
+        ],
+        cwd=Path(__file__).parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "rootless=true" in result.stderr
+    assert podman_log.exists()
+    assert not docker_log.exists()
+
+
+def test_builder_requires_explicit_backend_and_wrapper_forces_podman():
+    script = Path(__file__).parents[1] / "runner" / "build_isolated_image.sh"
+    result = subprocess.run(
+        ["bash", str(script), "--base-image", "invalid"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "usage:" in result.stderr
+    wrapper = subprocess.run(
+        [
+            "bash",
+            "runner/build_rootless_image.sh",
+            "--builder",
+            "docker",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert wrapper.returncode != 0
+    assert "always selects --builder podman-rootless" in wrapper.stderr
+
+
 def test_build_rejects_false_tool_version_labels():
     expected = build_identity.ExpectedIdentity(
         python_version="3.11.9",
@@ -961,6 +1273,7 @@ def test_runner_applies_security_boundary_and_no_reference_rtl(tmp_path: Path):
         config,
     )
     assert "--network" in command and command[command.index("--network") + 1] == "none"
+    assert "--pull=never" in command
     assert "--cap-drop" in command and command[command.index("--cap-drop") + 1] == "ALL"
     assert "--security-opt" in command and "no-new-privileges" in command
     assert "--read-only" in command
@@ -1033,6 +1346,31 @@ def test_invalid_or_extra_runtime_output_is_not_published(tmp_path: Path):
         assert not output.exists()
 
 
+def _require_rootless_podman_for_live_matrix() -> None:
+    if shutil.which("podman") is None:
+        raise RuntimeError("Podman is required when RTLBench_RUNNER_IMAGE is set")
+    rootless_result = subprocess.run(
+        ["podman", "info", "--format", "{{.Host.Security.Rootless}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if rootless_result.returncode != 0:
+        raise RuntimeError("Podman rootless probe failed when RTLBench_RUNNER_IMAGE is set")
+    if rootless_result.stdout.strip() != "true":
+        raise RuntimeError(
+            "Podman must report rootless=true when RTLBench_RUNNER_IMAGE is set"
+        )
+
+
+def test_selected_rootless_gate_requires_rootless_podman(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(shutil, "which", lambda _: None)
+    with pytest.raises(RuntimeError, match="Podman is required"):
+        _require_rootless_podman_for_live_matrix()
+
+
 @pytest.mark.integration
 def test_rootless_image_acceptance_matrix(tmp_path: Path):
     """Run the real synthetic matrix when a digest-qualified image is supplied."""
@@ -1040,17 +1378,10 @@ def test_rootless_image_acceptance_matrix(tmp_path: Path):
     image = os.environ.get("RTLBench_RUNNER_IMAGE")
     if not image:
         pytest.skip("set RTLBench_RUNNER_IMAGE to run the immutable-image acceptance matrix")
-    if shutil.which("podman") is None:
-        pytest.skip("rootless Podman is unavailable")
-    rootless_result = subprocess.run(
-        ["podman", "info", "--format", "{{.Host.Security.Rootless}}"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    rootless = rootless_result.stdout.strip() if rootless_result.returncode == 0 else ""
-    if rootless != "true":
-        pytest.skip("Podman is not rootless")
+    try:
+        _require_rootless_podman_for_live_matrix()
+    except RuntimeError as exc:
+        pytest.fail(str(exc))
 
     fixture_root = Path(__file__).parent / "fixtures" / "candidate_verification"
     handoff = tmp_path / "handoff"
@@ -1091,6 +1422,9 @@ def test_rootless_image_acceptance_matrix(tmp_path: Path):
         "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8"
     )
     before = _tree_hashes(handoff)
+    assert "--pull=never" in runner.build_run_command(
+        "podman", image, handoff, tmp_path, runner.load_config()
+    )
     output = tmp_path / "candidate_evidence.jsonl"
     result = runner.run_isolated(image=image, input_root=handoff, output=output)
     assert result.returncode == 0
@@ -1164,6 +1498,55 @@ def test_docker_pilot_image_acceptance_matrix(tmp_path: Path):
     before = _tree_hashes(handoff)
     output = tmp_path / "isolated-output" / "candidate_evidence.jsonl"
     output.parent.mkdir()
+
+    config = runner.load_config(profile=runner.PROFILE_PILOT_DOCKER)
+    create_command = runner.build_run_command(
+        "docker", image, handoff, output.parent, config
+    )
+    create_command[1] = "create"
+    created = subprocess.run(
+        create_command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if created.returncode != 0:
+        pytest.fail(f"Docker policy inspection container could not be created: {created.stderr}")
+    container_id = created.stdout.strip()
+    try:
+        inspected = subprocess.run(
+            ["docker", "inspect", container_id],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if inspected.returncode != 0:
+            pytest.fail(f"Docker policy inspection failed: {inspected.stderr}")
+        container = json.loads(inspected.stdout)[0]
+        host_config = container["HostConfig"]
+        assert container["Config"]["User"] == "65532:65532"
+        assert host_config["NetworkMode"] == "none"
+        assert host_config["ReadonlyRootfs"] is True
+        assert "ALL" in host_config["CapDrop"]
+        assert any(
+            "no-new-privileges" in option
+            for option in host_config["SecurityOpt"]
+        )
+        mounts = {mount["Destination"]: mount for mount in container["Mounts"]}
+        assert mounts["/input"]["RW"] is False
+        assert mounts["/output"]["RW"] is True
+        assert host_config["Memory"] == 536870912
+        assert host_config["MemorySwap"] == 536870912
+        assert host_config["NanoCpus"] == 1_000_000_000
+        assert host_config["PidsLimit"] == 64
+    finally:
+        subprocess.run(
+            ["docker", "rm", "-f", container_id],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
     result = runner.run_isolated(
         image=image,
         input_root=handoff,
@@ -1181,6 +1564,11 @@ def test_docker_pilot_image_acceptance_matrix(tmp_path: Path):
     assert sidecar["runtime"] == "docker"
     assert sidecar["runtime_mode"] == "rootful-daemon"
     assert sidecar["rootless"] is False
+    assert sidecar["schema_version"] == "rtlbench_runner_identity_v0.2"
+    assert sidecar["image_identity_kind"] in {
+        "local-image-id",
+        "repository-digest",
+    }
     assert sidecar["network_policy"] == "none"
     assert sidecar["manifest_sha256"] == hashlib.sha256(
         (handoff / "candidate_manifest.jsonl").read_bytes()
