@@ -233,7 +233,18 @@ def _fake_runtime(
             volume_name = args[-1]
             if {mode!r} == "volume_remove_failure":
                 raise SystemExit(1)
-            shutil.rmtree(Path({str(volume_root)!r}) / volume_name, ignore_errors=True)
+            volume = Path({str(volume_root)!r}) / volume_name
+            # A real container runtime removes the volume as the daemon/runtime
+            # owner, independently of the normalized read-only modes inside it.
+            # Model that behavior so the fake runtime is stable across Python
+            # versions and does not turn cleanup into a permissions test.
+            for current, directories, files in os.walk(volume, topdown=False):
+                for name in files:
+                    os.chmod(Path(current) / name, 0o600)
+                for name in directories:
+                    os.chmod(Path(current) / name, 0o700)
+            os.chmod(volume, 0o700)
+            shutil.rmtree(volume)
             print(volume_name)
             raise SystemExit(0)
         if args[:1] == ["ps"]:
@@ -258,7 +269,10 @@ def _fake_runtime(
                 raise SystemExit(1)
             if "tarfile.open" in program:
                 with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as archive:
-                    archive.extractall(input_root)
+                    if sys.version_info >= (3, 12):
+                        archive.extractall(input_root, filter="data")
+                    else:
+                        archive.extractall(input_root)
                 raise SystemExit(0)
             def file_hash(path):
                 digest = hashlib.sha256()
