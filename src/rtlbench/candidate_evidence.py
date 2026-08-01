@@ -356,21 +356,38 @@ def _validate_category_contract(
         raise CandidateEvidenceValidationError(
             f"{prefix}: positive mismatch requires functional_mismatch"
         )
-    if category == "compile_failure" and compile_leaf != {
+    standalone_compile_failure = compile_leaf == {
         "attempted": True,
         "passed": False,
         "reason": "compile_failure",
-    }:
-        raise CandidateEvidenceValidationError(
-            f"{prefix}: compile_failure requires a failed compile leaf"
-        )
-    if category == "compile_failure" and simulation_leaf != {
+    } and simulation_leaf == {
         "attempted": False,
         "passed": None,
         "reason": "compile_failure",
-    }:
+    }
+    simulation_elaboration_failure = compile_leaf == {
+        "attempted": True,
+        "passed": True,
+        "reason": None,
+    } and simulation_leaf == {
+        "attempted": True,
+        "passed": False,
+        "reason": "compile_failure",
+    }
+    if category == "compile_failure" and not (
+        standalone_compile_failure or simulation_elaboration_failure
+    ):
         raise CandidateEvidenceValidationError(
-            f"{prefix}: compile_failure must not contain simulation evidence"
+            f"{prefix}: compile_failure has no valid compile stage form"
+        )
+    if category == "compile_failure" and (
+        mismatch["reported_counts"]
+        or mismatch["reported_sample_counts"]
+        or mismatch["maximum_count"] is not None
+        or mismatch["timeout_reported"]
+    ):
+        raise CandidateEvidenceValidationError(
+            f"{prefix}: compile_failure must not contain mismatch or timeout evidence"
         )
 
     simulation_categories = {
@@ -386,18 +403,39 @@ def _validate_category_contract(
         raise CandidateEvidenceValidationError(
             f"{prefix}: {category} requires a successful compile leaf"
         )
-    simulation_timeout = simulation_leaf["attempted"] and (
-        simulation_leaf["reason"] == "timeout" or mismatch["timeout_reported"]
-    )
-    if category == "timeout" and simulation_timeout and compile_leaf["reason"] != "timeout":
-        if compile_leaf != {
-            "attempted": True,
-            "passed": True,
-            "reason": None,
-        }:
-            raise CandidateEvidenceValidationError(
-                f"{prefix}: simulation-stage timeout requires a successful compile leaf"
-            )
+    standalone_compile_timeout = compile_leaf == {
+        "attempted": True,
+        "passed": False,
+        "reason": "timeout",
+    } and simulation_leaf == {
+        "attempted": False,
+        "passed": None,
+        "reason": "compile_failure",
+    }
+    simulation_timeout = compile_leaf == {
+        "attempted": True,
+        "passed": True,
+        "reason": None,
+    } and simulation_leaf == {
+        "attempted": True,
+        "passed": False,
+        "reason": "timeout",
+    }
+    if category == "timeout" and not (
+        standalone_compile_timeout or simulation_timeout
+    ):
+        raise CandidateEvidenceValidationError(
+            f"{prefix}: timeout has no valid compile or simulation stage form"
+        )
+    if category == "timeout" and standalone_compile_timeout and (
+        mismatch["reported_counts"]
+        or mismatch["reported_sample_counts"]
+        or mismatch["maximum_count"] is not None
+        or mismatch["timeout_reported"]
+    ):
+        raise CandidateEvidenceValidationError(
+            f"{prefix}: standalone compile timeout must not contain simulation evidence"
+        )
     if category == "functional_mismatch" and not (
         simulation_leaf["attempted"]
         and simulation_leaf["passed"] is False
@@ -417,13 +455,6 @@ def _validate_category_contract(
     ):
         raise CandidateEvidenceValidationError(
             f"{prefix}: simulation_result_missing requires no mismatch report"
-        )
-    if category == "timeout" and not (
-        compile_leaf["reason"] == "timeout"
-        or simulation_timeout
-    ):
-        raise CandidateEvidenceValidationError(
-            f"{prefix}: timeout requires timeout evidence"
         )
     if category == "simulation_failure" and not (
         simulation_leaf["attempted"]

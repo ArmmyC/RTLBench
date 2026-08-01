@@ -382,6 +382,161 @@ def test_simulation_derived_evidence_requires_successful_compile(
         runner.validate_candidate_evidence_file(path, max_bytes=1_000_000)
 
 
+def test_compile_failure_with_successful_elaboration_is_rejected_if_mismatched(
+    tmp_path: Path,
+):
+    row = copy.deepcopy(_evidence_for_category("passed"))
+    row.update(accepted=False, failure_category="compile_failure")
+    row["checks"]["simulation"]["candidate_passes"] = {
+        "attempted": True,
+        "passed": False,
+        "reason": "compile_failure",
+    }
+    row["mismatch_summary"].update(
+        reported_counts=[1], reported_sample_counts=[1], maximum_count=1
+    )
+    path = tmp_path / "elaboration-compile-mismatch.jsonl"
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    with pytest.raises(runner.RunnerError):
+        runner.validate_candidate_evidence_file(path, max_bytes=1_000_000)
+
+
+def test_non_compile_failure_cannot_be_rebranded_as_compile_failure(
+    tmp_path: Path,
+):
+    row = copy.deepcopy(_evidence_for_category("passed"))
+    row.update(accepted=False, failure_category="compile_failure")
+    row["checks"]["compile"]["candidate"] = {
+        "attempted": True,
+        "passed": False,
+        "reason": "timeout",
+    }
+    row["checks"]["simulation"]["candidate_passes"] = {
+        "attempted": True,
+        "passed": False,
+        "reason": "compile_failure",
+    }
+    row["mismatch_summary"].update(
+        reported_counts=[], reported_sample_counts=[], maximum_count=None
+    )
+    path = tmp_path / "wrong-compile-stage.jsonl"
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    with pytest.raises(runner.RunnerError):
+        runner.validate_candidate_evidence_file(path, max_bytes=1_000_000)
+
+
+def test_standalone_compile_timeout_requires_unattempted_simulation(
+    tmp_path: Path,
+):
+    row = copy.deepcopy(_evidence_for_category("passed"))
+    row.update(accepted=False, failure_category="timeout")
+    row["checks"]["compile"]["candidate"] = {
+        "attempted": True,
+        "passed": False,
+        "reason": "timeout",
+    }
+    row["checks"]["simulation"]["candidate_passes"] = {
+        "attempted": False,
+        "passed": None,
+        "reason": "compile_failure",
+    }
+    row["mismatch_summary"].update(
+        reported_counts=[], reported_sample_counts=[], maximum_count=None,
+        timeout_reported=False,
+    )
+    path = tmp_path / "compile-timeout.jsonl"
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    assert runner.validate_candidate_evidence_file(path, max_bytes=1_000_000)
+
+
+@pytest.mark.parametrize("timeout_reported", [False, True])
+def test_simulation_timeout_requires_successful_compile(
+    tmp_path: Path, timeout_reported: bool
+):
+    row = copy.deepcopy(_evidence_for_category("passed"))
+    row.update(accepted=False, failure_category="timeout")
+    row["checks"]["simulation"]["candidate_passes"] = {
+        "attempted": True,
+        "passed": False,
+        "reason": "timeout",
+    }
+    row["mismatch_summary"]["timeout_reported"] = timeout_reported
+    path = tmp_path / f"simulation-timeout-{timeout_reported}.jsonl"
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    assert runner.validate_candidate_evidence_file(path, max_bytes=1_000_000)
+
+
+def test_both_timeout_stages_in_one_row_are_rejected(tmp_path: Path):
+    row = copy.deepcopy(_evidence_for_category("passed"))
+    row.update(accepted=False, failure_category="timeout")
+    row["checks"]["compile"]["candidate"] = {
+        "attempted": True,
+        "passed": False,
+        "reason": "timeout",
+    }
+    row["checks"]["simulation"]["candidate_passes"] = {
+        "attempted": True,
+        "passed": False,
+        "reason": "timeout",
+    }
+    row["mismatch_summary"].update(
+        reported_counts=[], reported_sample_counts=[], maximum_count=None,
+        timeout_reported=False,
+    )
+    path = tmp_path / "both-timeouts.jsonl"
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    with pytest.raises(runner.RunnerError):
+        runner.validate_candidate_evidence_file(path, max_bytes=1_000_000)
+
+
+def test_verifier_generated_simulation_elaboration_failure_validates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    row = verification.load_manifest(
+        Path(__file__).parent / "fixtures" / "candidate_verification" / "manifest.jsonl",
+        Path(__file__).parent / "fixtures" / "candidate_verification",
+    )[0]
+    toolchain = {
+        name: verification.ToolInfo(f"/fake/{name}", f"fake {name} 1.0")
+        for name in ("iverilog", "vvp", "verilator", "yosys")
+    }
+
+    def fake_run(command, cwd, timeout, max_output_bytes, environment):
+        stage_top = command[command.index("-s") + 1]
+        if stage_top == row.top_module:
+            return verification.CommandResult(0, "")
+        assert stage_top == row.testbench_top
+        return verification.CommandResult(1, "testbench elaboration failed")
+
+    monkeypatch.setattr(verification, "_run", fake_run)
+    evidence = verification.verify_row(
+        row,
+        input_hashes=verification.hash_inputs(row),
+        toolchain=toolchain,
+        work_dir=tmp_path / "work",
+        timeout=0.5,
+        workspace_root=Path(__file__).parent / "fixtures" / "candidate_verification",
+        manifest_path=Path(__file__).parent
+        / "fixtures"
+        / "candidate_verification"
+        / "manifest.jsonl",
+    )
+    assert evidence["failure_category"] == "compile_failure"
+    assert evidence["checks"]["compile"]["candidate"] == {
+        "attempted": True,
+        "passed": True,
+        "reason": None,
+    }
+    assert evidence["checks"]["simulation"]["candidate_passes"] == {
+        "attempted": True,
+        "passed": False,
+        "reason": "compile_failure",
+    }
+    path = tmp_path / "verifier-generated.jsonl"
+    path.write_text(json.dumps(evidence) + "\n", encoding="utf-8")
+    assert runner.validate_candidate_evidence_file(path, max_bytes=1_000_000)
+
+
 @pytest.mark.parametrize(
     "category",
     [
