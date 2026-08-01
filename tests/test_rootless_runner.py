@@ -266,7 +266,9 @@ def _write_fake_executable(path: Path, source: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
-def _fake_builder_tools(tmp_path: Path, commit: str) -> tuple[Path, Path, Path]:
+def _fake_builder_tools(
+    tmp_path: Path, commit: str, *, podman_rootless: bool = False
+) -> tuple[Path, Path, Path]:
     bin_root = tmp_path / "bin"
     bin_root.mkdir()
     git_source = textwrap.dedent(
@@ -313,10 +315,18 @@ def _fake_builder_tools(tmp_path: Path, commit: str) -> tuple[Path, Path, Path]:
         import json
         import sys
         from pathlib import Path
+        args = sys.argv[1:]
         log = Path({str(podman_log)!r})
-        log.write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
-        if sys.argv[1:2] == ["info"]:
-            print("false")
+        rows = json.loads(log.read_text()) if log.exists() else []
+        rows.append(args)
+        log.write_text(json.dumps(rows), encoding="utf-8")
+        if args[:1] == ["info"]:
+            print({"true" if podman_rootless else "false"!r})
+        elif args[:2] == ["image", "inspect"]:
+            if "--format" in args:
+                print("sha256:" + "d" * 64)
+        elif args[:1] == ["build"]:
+            pass
         else:
             raise SystemExit(2)
         """
@@ -1057,7 +1067,8 @@ def test_docker_builder_does_not_require_podman(tmp_path: Path):
     assert not podman_log.exists()
     build_rows = json.loads(docker_log.read_text())
     build_argv = next(row for row in build_rows if row[:1] == ["build"])
-    assert "--pull=never" in build_argv
+    assert "--pull=false" in build_argv
+    assert "--pull=never" not in build_argv
     assert "--file" in build_argv
     assert build_argv[build_argv.index("--file") + 1] == "runner/Dockerfile"
 
@@ -1087,6 +1098,38 @@ def test_podman_builder_rejects_rootful_podman(tmp_path: Path):
     assert "rootless=true" in result.stderr
     assert podman_log.exists()
     assert not docker_log.exists()
+
+
+def test_build_uses_podman_policy_pull_flag(tmp_path: Path):
+    commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], text=True
+    ).strip()
+    bin_root, docker_log, podman_log = _fake_builder_tools(
+        tmp_path, commit, podman_rootless=True
+    )
+    environment = os.environ.copy()
+    environment["PATH"] = f"{bin_root}:/usr/bin:/bin"
+    result = subprocess.run(
+        [
+            "bash",
+            "runner/build_isolated_image.sh",
+            "--builder",
+            "podman-rootless",
+            *_builder_arguments(commit),
+        ],
+        cwd=Path(__file__).parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not docker_log.exists()
+    build_argv = next(
+        row for row in json.loads(podman_log.read_text()) if row[:1] == ["build"]
+    )
+    assert "--pull=never" in build_argv
+    assert "--pull=false" not in build_argv
 
 
 def test_builder_requires_explicit_backend_and_wrapper_forces_podman():

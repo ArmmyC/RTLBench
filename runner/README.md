@@ -17,8 +17,9 @@ always selects `production-rootless`.
 
 Use the primary builder with an explicit backend. The Docker builder requires
 only ordinary Docker; it does not probe or fall back to Podman. The
-digest-qualified base image must already be local, and the build uses
-`--pull=never`:
+digest-qualified base image must already be local. Docker inspects it first
+and builds with `--pull=false`; rootless Podman inspects it first and builds
+with `--pull=never`:
 
 ```bash
 runner/build_isolated_image.sh \
@@ -47,7 +48,9 @@ The compatibility `runner/build_rootless_image.sh` wrapper always selects
 `--builder podman-rootless`; that backend requires Podman `rootless=true`.
 Both builders use the same `runner/Dockerfile`, require a clean checkout
 whose requested commit equals `HEAD`, verify exact package and runtime
-versions, and require the base image to be present locally.
+versions, and require the base image to be present locally. These
+backend-specific build flags are separate from the runtime no-pull flags
+documented below.
 
 For production-rootless, use a repository digest rather than the local image
 ID:

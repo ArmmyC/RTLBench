@@ -16,9 +16,10 @@ Podman and Docker.
 ## Immutable runtime
 
 Both profiles use the same image. It must be built from a digest-qualified
-base image with `--pull=never` after import, exact Debian package versions,
-exact normalized executable versions, and a clean checkout whose commit SHA
-matches the image label. The image must include:
+base image after local inspection, exact Debian package versions, exact
+normalized executable versions, and a clean checkout whose commit SHA matches
+the image label. Docker uses the Boolean build flag `--pull=false`; rootless
+Podman uses the policy flag `--pull=never`. The image must include:
 
 ```text
 non-root USER 65532:65532
@@ -68,8 +69,9 @@ runner/build_isolated_image.sh \
 
 `--builder podman-rootless` is the other explicit choice and requires
 `rootless=true`; `build_rootless_image.sh` remains a compatibility wrapper
-that always selects it. The builder requires a clean checkout, exact
-`HEAD`/commit identity, and `--pull=never`.
+that always selects it. The builder requires a clean checkout and exact
+`HEAD`/commit identity, and inspects the base image locally before either
+build.
 
 ## Profiles and CLI
 

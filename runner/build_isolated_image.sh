@@ -72,9 +72,11 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 
 runtime=
+build_pull_args=()
 case "$builder" in
   docker)
     runtime=docker
+    build_pull_args=(--pull=false)
     if ! command -v docker >/dev/null 2>&1; then
       echo "Docker is required for the docker image builder" >&2
       exit 2
@@ -86,6 +88,7 @@ case "$builder" in
     ;;
   podman-rootless)
     runtime=podman
+    build_pull_args=(--pull=never)
     if ! command -v podman >/dev/null 2>&1; then
       echo "rootless Podman is required for the podman-rootless image builder" >&2
       exit 2
@@ -103,7 +106,7 @@ if ! "$runtime" image inspect "$base_image" >/dev/null 2>&1; then
 fi
 
 "$runtime" build \
-  --pull=never \
+  "${build_pull_args[@]}" \
   --tag "$tag" \
   --build-arg "BASE_IMAGE=$base_image" \
   --build-arg "RTLBench_COMMIT=$rtlbench_commit" \
