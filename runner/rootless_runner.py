@@ -6,11 +6,13 @@ import argparse
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 from dataclasses import dataclass
@@ -28,6 +30,9 @@ from rtlbench.candidate_evidence import (  # noqa: E402
     sha256_workspace_tree,
     validate_candidate_evidence_file as _validate_candidate_evidence_file,
 )
+from rtlbench.candidate_verification import (  # noqa: E402
+    DEFAULT_MAX_RUN_INPUT_BYTES,
+)
 
 
 CONFIG_PATH = Path(__file__).with_name("runner_config.json")
@@ -41,6 +46,12 @@ CONTAINER_ENVIRONMENT = (
     ("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
 )
 MAX_RUNTIME_DIAGNOSTIC_BYTES = 65_536
+ARCHIVE_STREAM_CHUNK_BYTES = 64 * 1024
+PROBE_OUTPUT_LIMIT_BYTES = 8 * 1024
+INPUT_VOLUME_NAME_RE = re.compile(r"^rtlbench-input-[0-9a-f]{32}$")
+INPUT_VOLUME_LABEL = "io.rtlbench.runner.temporary-input"
+INPUT_VOLUME_LABEL_VALUE = "rtlbench_runtime_input_v0.1"
+MANAGED_CONTAINER_LABEL = "io.rtlbench.runner.managed-input-volume"
 RUNTIME_DIAGNOSTIC_TRUNCATION_MARKER = (
     "[runtime diagnostic truncated to 65536 bytes]"
 )
@@ -149,6 +160,280 @@ class ExecutionResult:
     diagnostic_truncated: bool
 
 
+@dataclass(frozen=True)
+class InputSnapshot:
+    archive_path: Path
+    manifest_sha256: str
+    workspace_tree_sha256: str
+    payload_bytes: int
+
+
+# These programs are fixed launcher code.  They are passed to the immutable
+# runner image with ``python -c``; no host paths, user commands, or archive
+# content is interpolated into them.
+POPULATE_INPUT_VOLUME_PROGRAM = r'''
+import os
+import shutil
+import stat
+import sys
+import tarfile
+import tempfile
+
+_ROOT = "/input"
+_CHUNK = 65536
+_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+if hasattr(os, "O_NOFOLLOW"):
+    _FLAGS |= os.O_NOFOLLOW
+
+
+def _fail():
+    raise SystemExit(1)
+
+
+def _name(member):
+    raw = member.name
+    if not isinstance(raw, str) or not raw or "\\" in raw:
+        _fail()
+    if member.isdir():
+        raw = raw.rstrip("/")
+    if not raw or raw.startswith("/"):
+        _fail()
+    parts = raw.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        _fail()
+    return raw
+
+
+def _allowed(name):
+    return name == "candidate_manifest.jsonl" or name == "workspace" or name.startswith("workspace/")
+
+
+def _mkdir(path):
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        if not stat.S_ISDIR(os.lstat(path).st_mode):
+            _fail()
+
+
+def _ensure_parent(path):
+    parent = os.path.dirname(path)
+    current = _ROOT
+    relative = os.path.relpath(parent, _ROOT)
+    if relative == ".":
+        return
+    for part in relative.split(os.sep):
+        if part in ("", ".", ".."):
+            _fail()
+        current = os.path.join(current, part)
+        _mkdir(current)
+
+
+def _write_file(member, source, destination):
+    _ensure_parent(destination)
+    try:
+        handle = os.open(destination, _FLAGS, 0o600)
+    except OSError:
+        _fail()
+    try:
+        remaining = member.size
+        while remaining:
+            chunk = source.read(min(_CHUNK, remaining))
+            if not chunk:
+                _fail()
+            view = memoryview(chunk)
+            while view:
+                written = os.write(handle, view)
+                if written <= 0:
+                    _fail()
+                view = view[written:]
+            remaining -= len(chunk)
+        if source.read(1):
+            _fail()
+        os.fsync(handle)
+        os.fchmod(handle, 0o444)
+    finally:
+        os.close(handle)
+
+
+def _normalize_tree(root):
+    for current, directories, files in os.walk(root, topdown=False, followlinks=False):
+        for name in files:
+            path = os.path.join(current, name)
+            if not stat.S_ISREG(os.lstat(path).st_mode):
+                _fail()
+            os.chmod(path, 0o444, follow_symlinks=False)
+        for name in directories:
+            path = os.path.join(current, name)
+            if not stat.S_ISDIR(os.lstat(path).st_mode):
+                _fail()
+            os.chmod(path, 0o555, follow_symlinks=False)
+
+
+try:
+    if os.listdir(_ROOT):
+        _fail()
+    staging = tempfile.mkdtemp(prefix=".rtlbench-input-", dir=_ROOT)
+    seen = set()
+    with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as archive:
+        previous_name = None
+        for member in archive:
+            name = _name(member)
+            if not _allowed(name) or name in seen:
+                _fail()
+            if previous_name is not None and name < previous_name:
+                _fail()
+            if name.rsplit("/", 1)[-1].casefold() == "reference.sv":
+                _fail()
+            if (
+                member.issym()
+                or member.islnk()
+                or member.isdev()
+                or member.isfifo()
+                or getattr(member, "issock", lambda: False)()
+            ):
+                _fail()
+            if not (member.isdir() or member.isreg()):
+                _fail()
+            if member.uid != 0 or member.gid != 0 or member.uname or member.gname or member.mtime != 0:
+                _fail()
+            if member.isdir() and (member.mode & 0o7777) != 0o555:
+                _fail()
+            if member.isreg() and (member.mode & 0o7777) != 0o444:
+                _fail()
+            if member.isdir() and name == "candidate_manifest.jsonl":
+                _fail()
+            if member.isreg() and name == "workspace":
+                _fail()
+            seen.add(name)
+            previous_name = name
+            destination = os.path.join(staging, name)
+            if member.isdir():
+                _mkdir(destination)
+            else:
+                source = archive.extractfile(member)
+                if source is None:
+                    _fail()
+                with source:
+                    _write_file(member, source, destination)
+    if "candidate_manifest.jsonl" not in seen or "workspace" not in seen:
+        _fail()
+    _normalize_tree(staging)
+    # Keep the staging root directory writable until its two top-level
+    # entries have been atomically moved into the volume root.
+    os.chmod(os.path.join(staging, "workspace"), 0o700)
+    os.replace(os.path.join(staging, "candidate_manifest.jsonl"), os.path.join(_ROOT, "candidate_manifest.jsonl"))
+    os.replace(os.path.join(staging, "workspace"), os.path.join(_ROOT, "workspace"))
+    os.rmdir(staging)
+    os.chmod(os.path.join(_ROOT, "candidate_manifest.jsonl"), 0o444)
+    os.chmod(os.path.join(_ROOT, "workspace"), 0o555)
+    os.chmod(_ROOT, 0o555)
+except Exception:
+    try:
+        if "staging" in globals():
+            shutil.rmtree(staging)
+    except Exception:
+        pass
+    raise SystemExit(1)
+'''.strip()
+
+
+PROBE_INPUT_VOLUME_PROGRAM = r'''
+import hashlib
+import json
+import os
+import stat
+
+_ROOT = "/input"
+_CHUNK = 65536
+
+
+def _fail():
+    raise SystemExit(1)
+
+
+def _regular(path):
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        _fail()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        _fail()
+
+
+def _directory(path):
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError:
+        _fail()
+    if not stat.S_ISDIR(mode):
+        _fail()
+
+
+def _file_hash(path):
+    _regular(path)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        handle = os.open(path, flags)
+    except OSError:
+        _fail()
+    digest = hashlib.sha256()
+    try:
+        while True:
+            chunk = os.read(handle, _CHUNK)
+            if not chunk:
+                break
+            digest.update(chunk)
+    finally:
+        os.close(handle)
+    return digest.hexdigest()
+
+
+def _workspace_hash(root):
+    _directory(root)
+    digest = hashlib.sha256()
+    def visit(current):
+        try:
+            entries = sorted(os.scandir(current), key=lambda item: item.name)
+        except OSError:
+            _fail()
+        for entry in entries:
+            path = entry.path
+            if entry.is_symlink():
+                _fail()
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError:
+                _fail()
+            relative = os.path.relpath(path, root).replace(os.sep, "/")
+            if stat.S_ISDIR(metadata.st_mode):
+                digest.update(b"D\0" + relative.encode() + b"\n")
+                visit(path)
+            elif stat.S_ISREG(metadata.st_mode):
+                if entry.name.casefold() == "reference.sv":
+                    _fail()
+                digest.update(b"F\0" + relative.encode() + b"\0" + _file_hash(path).encode() + b"\n")
+            else:
+                _fail()
+    visit(root)
+    return digest.hexdigest()
+
+
+try:
+    _directory(_ROOT)
+    names = sorted(os.listdir(_ROOT))
+    if names != ["candidate_manifest.jsonl", "workspace"]:
+        _fail()
+    manifest = _file_hash(os.path.join(_ROOT, "candidate_manifest.jsonl"))
+    workspace = _workspace_hash(os.path.join(_ROOT, "workspace"))
+    print(json.dumps({"manifest_sha256": manifest, "workspace_tree_sha256": workspace}, sort_keys=True, separators=(",", ":")))
+except Exception:
+    raise SystemExit(1)
+'''.strip()
+
+
 class _DiagnosticTail:
     def __init__(self, limit: int) -> None:
         self._limit = limit
@@ -215,19 +500,27 @@ def _sanitize_runtime_diagnostic(
 
 def _runtime_diagnostic_replacements(
     *,
-    input_root: Path,
+    input_root: Path | None,
     output: Path,
     staging: Path,
     runtime_environment: Path,
+    input_volume: str | None = None,
+    archive_path: Path | None = None,
 ) -> dict[str, str]:
     """Return stable placeholders for paths owned by this launcher."""
-    return {
-        str(input_root.resolve()): "<input>",
+    replacements = {
         str(output.resolve()): "<output>",
         str(staging.resolve()): "<staging>",
         str(runtime_environment.resolve()): "<runtime-environment>",
         str(Path(tempfile.gettempdir()).resolve()): "<temporary>",
     }
+    if input_root is not None:
+        replacements[str(input_root.resolve())] = "<input>"
+    if archive_path is not None:
+        replacements[str(archive_path.resolve())] = "<temporary>"
+    if input_volume:
+        replacements[input_volume] = "<input-volume>"
+    return replacements
 
 
 def _format_runtime_diagnostic(diagnostic: str, truncated: bool) -> str:
@@ -346,20 +639,16 @@ def load_config(
 def build_run_command(
     runtime: str,
     image: str,
-    input_root: Path,
+    input_volume: str,
     output_root: Path,
     config: RunnerConfig,
 ) -> list[str]:
-    """Build the only container command this runner permits."""
-    pull_args = (
-        ["--pull=never"]
-        if config.profile == PROFILE_PRODUCTION_ROOTLESS
-        else ["--pull", "never"]
-    )
+    """Build the only fixed candidate container command this runner permits."""
+    _validate_input_volume_name(input_volume)
     command = [
         runtime,
         "run",
-        *pull_args,
+        *_pull_args(config),
         "--rm",
         "--network",
         "none",
@@ -370,6 +659,282 @@ def build_run_command(
         "--security-opt",
         "no-new-privileges",
         "--read-only",
+        *_resource_arguments(config),
+        "--mount",
+        _volume_mount(input_volume, config, readonly=True),
+        "--mount",
+        f"type=bind,src={output_root},dst=/output",
+        "--label",
+        f"{MANAGED_CONTAINER_LABEL}={input_volume}",
+        "--workdir",
+        "/work",
+        *_fixed_environment_arguments(include_bytecode_flag=False),
+        "--entrypoint",
+        "rtlbench",
+        image,
+        *config.inner_command[1:],
+    ]
+    if config.profile == PROFILE_PRODUCTION_ROOTLESS:
+        index = command.index("--cap-drop")
+        command[index:index] = ["--userns", "private"]
+    return command
+
+
+def _format_cpu_limit(value: float) -> str:
+    return str(int(value)) if value.is_integer() else str(value)
+
+
+def _validate_input_volume_name(volume_name: str) -> str:
+    if not isinstance(volume_name, str) or not INPUT_VOLUME_NAME_RE.fullmatch(volume_name):
+        raise RunnerError("temporary input volume name is invalid")
+    return volume_name
+
+
+def _snapshot_entries(input_root: Path) -> list[tuple[str, Path, bool, int]]:
+    """Return the only handoff entries that may enter the private archive."""
+
+    entries: list[tuple[str, Path, bool, int]] = []
+
+    def add_entry(relative: str, path: Path, is_directory: bool) -> None:
+        if path.name.casefold() == "reference.sv":
+            raise RunnerError("input handoff must not contain reference.sv")
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise RunnerError(f"could not inspect input handoff entry: {relative}") from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise RunnerError(f"input snapshot source contains symlink: {relative}")
+        if is_directory:
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise RunnerError(f"input snapshot directory changed type: {relative}")
+            entries.append((relative, path, True, 0))
+            return
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RunnerError(f"input snapshot source is not a regular file: {relative}")
+        if metadata.st_nlink != 1:
+            raise RunnerError(f"input snapshot source contains a hard link: {relative}")
+        entries.append((relative, path, False, metadata.st_size))
+
+    manifest = input_root / "candidate_manifest.jsonl"
+    workspace = input_root / "workspace"
+    add_entry("candidate_manifest.jsonl", manifest, False)
+    add_entry("workspace", workspace, True)
+
+    def visit(directory: Path, prefix: str) -> None:
+        try:
+            children = sorted(os.scandir(directory), key=lambda item: item.name)
+        except OSError as exc:
+            raise RunnerError(f"could not enumerate input snapshot directory: {prefix}") from exc
+        for child in children:
+            relative = f"{prefix}/{child.name}"
+            if child.is_symlink():
+                raise RunnerError(f"input snapshot source contains symlink: {relative}")
+            try:
+                mode = child.stat(follow_symlinks=False).st_mode
+            except OSError as exc:
+                raise RunnerError(f"could not inspect input snapshot entry: {relative}") from exc
+            if stat.S_ISDIR(mode):
+                add_entry(relative, Path(child.path), True)
+                visit(Path(child.path), relative)
+            elif stat.S_ISREG(mode):
+                add_entry(relative, Path(child.path), False)
+            else:
+                raise RunnerError(f"input snapshot source contains special file: {relative}")
+
+    visit(workspace, "workspace")
+    entries.sort(key=lambda item: item[0])
+    return entries
+
+
+class _BoundedFileReader:
+    def __init__(self, handle: Any, size: int) -> None:
+        self._handle = handle
+        self._remaining = size
+        self.read_bytes = 0
+
+    def read(self, size: int = -1) -> bytes:
+        if self._remaining <= 0:
+            return b""
+        if size < 0 or size > ARCHIVE_STREAM_CHUNK_BYTES:
+            size = ARCHIVE_STREAM_CHUNK_BYTES
+        size = min(size, self._remaining)
+        data = self._handle.read(size)
+        if data:
+            self.read_bytes += len(data)
+            self._remaining -= len(data)
+        return data
+
+
+def _open_snapshot_file(input_root: Path, relative: str) -> int:
+    """Open a snapshot file without following any directory or file symlink."""
+
+    directory_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    file_flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        file_flags |= os.O_NOFOLLOW
+    descriptors: list[int] = []
+    try:
+        current = os.open(input_root, directory_flags)
+        descriptors.append(current)
+        parts = relative.split("/")
+        for part in parts[:-1]:
+            current = os.open(part, directory_flags, dir_fd=current)
+            descriptors.append(current)
+        return os.open(parts[-1], file_flags, dir_fd=current)
+    finally:
+        # The returned file descriptor owns its own open file description; all
+        # directory descriptors used for traversal can be closed immediately.
+        if descriptors:
+            for descriptor in reversed(descriptors):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+
+def _create_input_snapshot_archive(
+    input_root: Path,
+    archive_path: Path,
+    *,
+    expected_manifest_sha256: str,
+    expected_workspace_tree_sha256: str,
+) -> InputSnapshot:
+    """Create a deterministic, private archive of only verifier input files."""
+
+    input_root = Path(input_root).resolve()
+    archive_path = Path(archive_path)
+    if archive_path.exists() or archive_path.is_symlink():
+        raise RunnerError("input snapshot archive path already exists")
+    _validate_no_reference_rtl(input_root)
+    entries = _snapshot_entries(input_root)
+    payload_bytes = sum(size for _, _, is_directory, size in entries if not is_directory)
+    if payload_bytes > DEFAULT_MAX_RUN_INPUT_BYTES:
+        raise RunnerError(
+            f"input snapshot exceeds {DEFAULT_MAX_RUN_INPUT_BYTES} bytes"
+        )
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(
+        archive_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "wb", closefd=True) as archive_handle:
+            descriptor = -1
+            with tarfile.open(
+                fileobj=archive_handle,
+                mode="w",
+                format=tarfile.PAX_FORMAT,
+            ) as archive:
+                for relative, path, is_directory, expected_size in entries:
+                    normalized_name = relative + "/" if is_directory else relative
+                    info = tarfile.TarInfo(normalized_name)
+                    info.uid = 0
+                    info.gid = 0
+                    info.uname = ""
+                    info.gname = ""
+                    info.mtime = 0
+                    info.mode = 0o555 if is_directory else 0o444
+                    if is_directory:
+                        info.type = tarfile.DIRTYPE
+                        archive.addfile(info)
+                        continue
+                    info.type = tarfile.REGTYPE
+                    info.size = expected_size
+                    try:
+                        file_descriptor = _open_snapshot_file(input_root, relative)
+                    except OSError as exc:
+                        raise RunnerError(
+                            f"could not open input snapshot file: {relative}"
+                        ) from exc
+                    try:
+                        before = os.fstat(file_descriptor)
+                        if (
+                            not stat.S_ISREG(before.st_mode)
+                            or before.st_nlink != 1
+                            or before.st_size != expected_size
+                        ):
+                            raise RunnerError(
+                                f"input snapshot file changed before archive: {relative}"
+                            )
+                        with os.fdopen(file_descriptor, "rb", closefd=True) as source:
+                            file_descriptor = -1
+                            bounded = _BoundedFileReader(source, expected_size)
+                            archive.addfile(info, fileobj=bounded)
+                            after = os.fstat(source.fileno())
+                            if bounded.read_bytes != expected_size or (
+                                not stat.S_ISREG(after.st_mode)
+                                or after.st_nlink != 1
+                                or after.st_size != expected_size
+                                or after.st_ino != before.st_ino
+                                or after.st_dev != before.st_dev
+                            ):
+                                raise RunnerError(
+                                    f"input snapshot file changed while archiving: {relative}"
+                                )
+                    finally:
+                        if file_descriptor >= 0:
+                            os.close(file_descriptor)
+            archive_handle.flush()
+            os.fsync(archive_handle.fileno())
+        os.chmod(archive_path, 0o600)
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            archive_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    try:
+        manifest_sha256 = sha256_file(input_root / "candidate_manifest.jsonl")
+        workspace_tree_sha256 = sha256_workspace_tree(input_root / "workspace")
+        if manifest_sha256 != expected_manifest_sha256:
+            raise RunnerError("input manifest changed while creating snapshot archive")
+        if workspace_tree_sha256 != expected_workspace_tree_sha256:
+            raise RunnerError("input workspace changed while creating snapshot archive")
+    except Exception:
+        try:
+            archive_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return InputSnapshot(
+        archive_path=archive_path,
+        manifest_sha256=manifest_sha256,
+        workspace_tree_sha256=workspace_tree_sha256,
+        payload_bytes=payload_bytes,
+    )
+
+
+def _pull_args(config: RunnerConfig) -> list[str]:
+    return (
+        ["--pull=never"]
+        if config.profile == PROFILE_PRODUCTION_ROOTLESS
+        else ["--pull", "never"]
+    )
+
+
+def _volume_mount(
+    volume_name: str,
+    config: RunnerConfig,
+    *,
+    readonly: bool,
+) -> str:
+    _validate_input_volume_name(volume_name)
+    options = ["type=volume", f"src={volume_name}", "dst=/input"]
+    if readonly:
+        options.append("ro" if config.profile == PROFILE_PRODUCTION_ROOTLESS else "readonly")
+    options.append("volume-nocopy")
+    return ",".join(options)
+
+
+def _resource_arguments(config: RunnerConfig) -> list[str]:
+    return [
         "--cpus",
         _format_cpu_limit(config.cpus),
         "--memory",
@@ -388,34 +953,281 @@ def build_run_command(
         f"/tmp:rw,nosuid,nodev,noexec,size={config.tmp_bytes},mode=1777",
         "--tmpfs",
         f"/work:rw,nosuid,nodev,size={config.work_bytes},uid=65532,gid=65532,mode=700",
-        "--mount",
-        f"type=bind,src={input_root},dst=/input,{_input_mount_mode(config)}",
-        "--mount",
-        f"type=bind,src={output_root},dst=/output",
-        "--workdir",
-        "/work",
-        *[
-            argument
-            for name, value in CONTAINER_ENVIRONMENT
-            for argument in ("--env", f"{name}={value}")
-        ],
-        "--entrypoint",
-        "rtlbench",
-        image,
-        *config.inner_command[1:],
     ]
+
+
+def _fixed_environment_arguments(*, include_bytecode_flag: bool) -> list[str]:
+    arguments = [
+        argument
+        for name, value in CONTAINER_ENVIRONMENT
+        for argument in ("--env", f"{name}={value}")
+    ]
+    if include_bytecode_flag:
+        arguments.extend(("--env", "PYTHONDONTWRITEBYTECODE=1"))
+    return arguments
+
+
+def _helper_command(
+    runtime: str,
+    image: str,
+    volume_name: str,
+    config: RunnerConfig,
+    *,
+    program: str,
+    user: str,
+    readonly_volume: bool,
+    interactive: bool,
+) -> list[str]:
+    command = [
+        runtime,
+        "run",
+        *_pull_args(config),
+        "--rm",
+    ]
+    if interactive:
+        command.append("--interactive")
+    command.extend(
+        [
+            "--network",
+            "none",
+            "--user",
+            user,
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--read-only",
+            *_resource_arguments(config),
+            "--mount",
+            _volume_mount(volume_name, config, readonly=readonly_volume),
+            "--label",
+            f"{MANAGED_CONTAINER_LABEL}={volume_name}",
+            *_fixed_environment_arguments(include_bytecode_flag=True),
+            "--entrypoint",
+            "/usr/local/bin/python",
+            image,
+            "-c",
+            program,
+        ]
+    )
     if config.profile == PROFILE_PRODUCTION_ROOTLESS:
         index = command.index("--cap-drop")
         command[index:index] = ["--userns", "private"]
     return command
 
 
-def _input_mount_mode(config: RunnerConfig) -> str:
-    return "ro" if config.profile == PROFILE_PRODUCTION_ROOTLESS else "readonly"
+def _build_population_command(
+    runtime: str, image: str, volume_name: str, config: RunnerConfig
+) -> list[str]:
+    return _helper_command(
+        runtime,
+        image,
+        volume_name,
+        config,
+        program=POPULATE_INPUT_VOLUME_PROGRAM,
+        user="0:0",
+        readonly_volume=False,
+        interactive=True,
+    )
 
 
-def _format_cpu_limit(value: float) -> str:
-    return str(int(value)) if value.is_integer() else str(value)
+def _build_probe_command(
+    runtime: str, image: str, volume_name: str, config: RunnerConfig
+) -> list[str]:
+    return _helper_command(
+        runtime,
+        image,
+        volume_name,
+        config,
+        program=PROBE_INPUT_VOLUME_PROGRAM,
+        user=config.runtime_user,
+        readonly_volume=True,
+        interactive=False,
+    )
+
+
+def _new_input_volume_name() -> str:
+    return f"rtlbench-input-{secrets.token_hex(16)}"
+
+
+def _create_input_volume(
+    runtime: str,
+    volume_name: str,
+    config: RunnerConfig,
+) -> None:
+    _validate_input_volume_name(volume_name)
+    environment = _runtime_environment(None, include_runtime_dir=config.rootless)
+    existing = _run_checked(
+        [runtime, "volume", "inspect", volume_name],
+        timeout=10.0,
+        environment=environment,
+    )
+    if existing.returncode == 0:
+        raise RunnerError("temporary input volume already exists")
+    created = False
+    try:
+        result = _run_checked(
+            [
+                runtime,
+                "volume",
+                "create",
+                "--label",
+                f"{INPUT_VOLUME_LABEL}={INPUT_VOLUME_LABEL_VALUE}",
+                volume_name,
+            ],
+            timeout=10.0,
+            environment=environment,
+        )
+        if result.returncode != 0:
+            raise RunnerError("container runtime did not create the requested input volume")
+        created = True
+        if result.stdout.strip() != volume_name:
+            raise RunnerError("container runtime did not return the requested input volume name")
+        inspected = _run_checked(
+            [
+                runtime,
+                "volume",
+                "inspect",
+                "--format",
+                "{{json .Labels}}",
+                volume_name,
+            ],
+            timeout=10.0,
+            environment=environment,
+        )
+        if inspected.returncode != 0:
+            raise RunnerError("could not inspect the temporary input volume")
+        try:
+            labels = json.loads(inspected.stdout.strip())
+        except json.JSONDecodeError as exc:
+            raise RunnerError("temporary input volume labels are not valid JSON") from exc
+        if not isinstance(labels, dict) or labels.get(INPUT_VOLUME_LABEL) != INPUT_VOLUME_LABEL_VALUE:
+            raise RunnerError("temporary input volume label is invalid")
+    except Exception:
+        if created:
+            _remove_input_volume(runtime, volume_name, config)
+        raise
+
+
+def _remove_input_volume(
+    runtime: str,
+    volume_name: str,
+    config: RunnerConfig,
+) -> None:
+    environment = _runtime_environment(None, include_runtime_dir=config.rootless)
+    removed = _run_checked(
+        [runtime, "volume", "rm", volume_name],
+        timeout=10.0,
+        environment=environment,
+    )
+    if removed.returncode == 0:
+        remaining = _run_checked(
+            [runtime, "volume", "inspect", volume_name],
+            timeout=10.0,
+            environment=environment,
+        )
+        if remaining.returncode != 0:
+            return
+    managed = _run_checked(
+        [
+            runtime,
+            "ps",
+            "-aq",
+            "--filter",
+            f"label={MANAGED_CONTAINER_LABEL}={volume_name}",
+        ],
+        timeout=10.0,
+        environment=environment,
+    )
+    container_ids = [item for item in managed.stdout.split() if item]
+    if container_ids:
+        _run_checked(
+            [runtime, "rm", "-f", *container_ids],
+            timeout=10.0,
+            environment=environment,
+        )
+        removed = _run_checked(
+            [runtime, "volume", "rm", volume_name],
+            timeout=10.0,
+            environment=environment,
+        )
+        remaining = _run_checked(
+            [runtime, "volume", "inspect", volume_name],
+            timeout=10.0,
+            environment=environment,
+        )
+        if removed.returncode == 0 and remaining.returncode != 0:
+            return
+    raise RunnerError("could not remove temporary input volume <input-volume>")
+
+
+def _run_input_helper(
+    command: Sequence[str],
+    *,
+    archive_path: Path | None,
+    timeout: float,
+    environment: Mapping[str, str],
+    replacements: Mapping[str, str],
+    description: str,
+) -> ExecutionResult:
+    result = _execute(
+        command,
+        timeout=timeout,
+        environment=environment,
+        diagnostic_replacements=replacements,
+        stdin_path=archive_path,
+    )
+    if result.timed_out:
+        raise RunnerError(
+            f"{description} timed out"
+            + _format_runtime_diagnostic(
+                result.diagnostic_output, result.diagnostic_truncated
+            )
+        )
+    if result.returncode != 0:
+        raise RunnerError(
+            f"{description} failed with status {result.returncode}"
+            + _format_runtime_diagnostic(
+                result.diagnostic_output, result.diagnostic_truncated
+            )
+        )
+    return result
+
+
+def _probe_input_volume(
+    command: Sequence[str],
+    *,
+    expected_manifest_sha256: str,
+    expected_workspace_tree_sha256: str,
+    timeout: float,
+    environment: Mapping[str, str],
+    replacements: Mapping[str, str],
+) -> None:
+    result = _run_input_helper(
+        command,
+        archive_path=None,
+        timeout=timeout,
+        environment=environment,
+        replacements=replacements,
+        description="runtime-user input probe",
+    )
+    encoded = result.diagnostic_output.encode("utf-8", errors="replace")
+    if result.diagnostic_truncated or len(encoded) > PROBE_OUTPUT_LIMIT_BYTES:
+        raise RunnerError("runtime-user input probe produced excessive output")
+    try:
+        value = json.loads(result.diagnostic_output)
+    except json.JSONDecodeError as exc:
+        raise RunnerError("runtime-user input probe returned malformed output") from exc
+    if not isinstance(value, dict) or set(value) != {
+        "manifest_sha256",
+        "workspace_tree_sha256",
+    }:
+        raise RunnerError("runtime-user input probe returned unexpected output")
+    if (
+        value["manifest_sha256"] != expected_manifest_sha256
+        or value["workspace_tree_sha256"] != expected_workspace_tree_sha256
+    ):
+        raise RunnerError("staged input hashes do not match canonical handoff hashes")
 
 
 def run_isolated(
@@ -471,50 +1283,104 @@ def run_isolated(
 
     with tempfile.TemporaryDirectory(prefix=".rtlbench-runner-output-") as output_tmp:
         with tempfile.TemporaryDirectory(prefix=".rtlbench-runner-env-") as env_tmp:
+            runtime_environment = Path(env_tmp)
             staged_output = Path(output_tmp)
             staged_output.chmod(0o777)
-            command = build_run_command(runtime_path, image, input_root, staged_output, config)
-            runtime_environment = Path(env_tmp)
-            execution = _execute(
-                command,
-                timeout=timeout,
-                environment=_runtime_environment(
-                    runtime_environment, include_runtime_dir=config.rootless
-                ),
-                diagnostic_replacements=_runtime_diagnostic_replacements(
+            runtime_environment_values = _runtime_environment(
+                runtime_environment, include_runtime_dir=config.rootless
+            )
+            execution: ExecutionResult
+            final: Path
+            partial: Path
+            final_exists = False
+            partial_exists = False
+            volume_name = _new_input_volume_name()
+            volume_created = False
+            with tempfile.TemporaryDirectory(prefix=".rtlbench-runner-input-") as input_tmp:
+                archive_path = Path(input_tmp) / "input.tar"
+                replacements = _runtime_diagnostic_replacements(
                     input_root=input_root,
                     output=output,
                     staging=staged_output,
                     runtime_environment=runtime_environment,
-                ),
-            )
-            _reject_unexpected_output(staged_output, config)
-            final = staged_output / "candidate_evidence.jsonl"
-            partial = staged_output / "candidate_evidence.jsonl.rtlbench-partial"
-            final_exists = final.exists()
-            partial_exists = partial.exists()
-            if final_exists:
-                validate_candidate_evidence_file(final, max_bytes=config.evidence_bytes)
-            if not final_exists and not partial_exists:
-                if execution.timed_out:
-                    raise RunnerError(
-                        "runner wall timeout expired without preserved evidence"
-                        + _format_runtime_diagnostic(
-                            execution.diagnostic_output,
-                            execution.diagnostic_truncated,
-                        )
-                    )
-                raise RunnerError(
-                    f"isolated RTLBench exited with status {execution.returncode} without evidence"
-                    + _format_runtime_diagnostic(
-                        execution.diagnostic_output,
-                        execution.diagnostic_truncated,
-                    )
+                    input_volume=volume_name,
+                    archive_path=archive_path,
                 )
+                try:
+                    _create_input_snapshot_archive(
+                        input_root,
+                        archive_path,
+                        expected_manifest_sha256=manifest_sha256,
+                        expected_workspace_tree_sha256=workspace_tree_sha256,
+                    )
+                    _create_input_volume(runtime_path, volume_name, config)
+                    volume_created = True
+                    population = _run_input_helper(
+                        _build_population_command(
+                            runtime_path, image, volume_name, config
+                        ),
+                        archive_path=archive_path,
+                        timeout=timeout,
+                        environment=runtime_environment_values,
+                        replacements=replacements,
+                        description="input population helper",
+                    )
+                    if population.diagnostic_output:
+                        raise RunnerError("input population helper produced unexpected output")
+                    _probe_input_volume(
+                        _build_probe_command(runtime_path, image, volume_name, config),
+                        expected_manifest_sha256=manifest_sha256,
+                        expected_workspace_tree_sha256=workspace_tree_sha256,
+                        timeout=timeout,
+                        environment=runtime_environment_values,
+                        replacements=replacements,
+                    )
+                    execution = _execute(
+                        build_run_command(
+                            runtime_path, image, volume_name, staged_output, config
+                        ),
+                        timeout=timeout,
+                        environment=runtime_environment_values,
+                        diagnostic_replacements=replacements,
+                    )
+                    _reject_unexpected_output(staged_output, config)
+                    final = staged_output / "candidate_evidence.jsonl"
+                    partial = staged_output / "candidate_evidence.jsonl.rtlbench-partial"
+                    final_exists = final.exists()
+                    partial_exists = partial.exists()
+                    if final_exists:
+                        validate_candidate_evidence_file(
+                            final, max_bytes=config.evidence_bytes
+                        )
+                    if not final_exists and not partial_exists:
+                        if execution.timed_out:
+                            raise RunnerError(
+                                "runner wall timeout expired without preserved evidence"
+                                + _format_runtime_diagnostic(
+                                    execution.diagnostic_output,
+                                    execution.diagnostic_truncated,
+                                )
+                            )
+                        raise RunnerError(
+                            f"isolated RTLBench exited with status {execution.returncode} without evidence"
+                            + _format_runtime_diagnostic(
+                                execution.diagnostic_output,
+                                execution.diagnostic_truncated,
+                            )
+                        )
+                    if sha256_file(manifest_path) != manifest_sha256:
+                        raise RunnerError("input manifest changed during isolated execution")
+                    if sha256_workspace_tree(workspace_path) != workspace_tree_sha256:
+                        raise RunnerError("input workspace changed during isolated execution")
+                finally:
+                    if volume_created:
+                        _remove_input_volume(runtime_path, volume_name, config)
+            # The input volume, private archive, and input temporary directory
+            # are gone before any managed evidence is published.
             if sha256_file(manifest_path) != manifest_sha256:
-                raise RunnerError("input manifest changed during isolated execution")
+                raise RunnerError("input manifest changed before evidence publication")
             if sha256_workspace_tree(workspace_path) != workspace_tree_sha256:
-                raise RunnerError("input workspace changed during isolated execution")
+                raise RunnerError("input workspace changed before evidence publication")
             if output.exists() and not force_output:
                 raise RunnerError(f"output already exists: {output}")
             partial_destination = Path(str(output) + ".rtlbench-partial")
@@ -723,12 +1589,16 @@ def _execute(
     timeout: float,
     environment: Mapping[str, str],
     diagnostic_replacements: Mapping[str, str] | None = None,
+    stdin_path: Path | None = None,
 ) -> ExecutionResult:
     replacements = diagnostic_replacements or {}
+    stdin_handle: Any | None = None
     try:
+        if stdin_path is not None:
+            stdin_handle = Path(stdin_path).open("rb")
         process = subprocess.Popen(
             list(command),
-            stdin=subprocess.DEVNULL,
+            stdin=stdin_handle if stdin_handle is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -742,6 +1612,12 @@ def _execute(
             "could not start isolated RTLBench"
             + _format_runtime_diagnostic(diagnostic, truncated)
         ) from exc
+    finally:
+        if stdin_handle is not None:
+            try:
+                stdin_handle.close()
+            except OSError:
+                pass
     if process.stdout is None:
         _terminate_process_group(process)
         raise RunnerError("isolated RTLBench runtime did not provide a diagnostic pipe")
@@ -761,6 +1637,9 @@ def _execute(
             _terminate_process_group(process)
             returncode = 124
             timed_out = True
+        except KeyboardInterrupt:
+            _terminate_process_group(process)
+            raise
     finally:
         reader.join(timeout=5.0)
         if reader.is_alive():
