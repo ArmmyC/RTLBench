@@ -1,0 +1,33 @@
+{
+  "runner_config_version": "rtlbench_rootless_runner_v0.1",
+  "runtime": "podman-rootless",
+  "runtime_user": "65532:65532",
+  "inner_command": [
+    "rtlbench",
+    "verify-candidates",
+    "--manifest",
+    "/input/candidate_manifest.jsonl",
+    "--output",
+    "/output/candidate_evidence.jsonl",
+    "--workspace-root",
+    "/input/workspace",
+    "--work-dir",
+    "/work",
+    "--force"
+  ],
+  "limits": {
+    "cpus": 2.0,
+    "memory_bytes": 536870912,
+    "pids": 128,
+    "file_size_bytes": 33554432,
+    "open_files": 256,
+    "work_bytes": 268435456,
+    "tmp_bytes": 134217728,
+    "wall_seconds": 120.0,
+    "evidence_bytes": 33554432
+  },
+  "allowed_output_names": [
+    "candidate_evidence.jsonl",
+    "candidate_evidence.jsonl.rtlbench-partial"
+  ]
+}
