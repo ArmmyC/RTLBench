@@ -29,12 +29,19 @@ from rtlbench.candidate_verification import (
 )
 
 
-def build_parser() -> argparse.ArgumentParser:
-    from rtlbench.adapters import ADAPTERS
+BENCHMARK_CHOICES = (
+    "protocollm",
+    "rfid_apbench",
+    "rtllm2",
+    "rtlopt",
+    "verilogeval",
+)
 
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run RTL generation benchmarks")
     parser.add_argument("--config", type=Path, default=Path("configs/verilogeval.yaml"))
-    parser.add_argument("--benchmark", choices=sorted(ADAPTERS))
+    parser.add_argument("--benchmark", choices=BENCHMARK_CHOICES)
     parser.add_argument("--benchmark-root", dest="root")
     parser.add_argument("--split")
     parser.add_argument("--model-preset")

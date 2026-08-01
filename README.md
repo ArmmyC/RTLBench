@@ -129,6 +129,23 @@ production secrets, and apply CPU, memory, process, output, disk, and time
 limits externally. This command does not implement a universal sandbox, so
 host execution must not be considered safe merely because paths are validated.
 
+The repository includes an explicit-profile launcher under `runner/`. Use
+`production-rootless` with rootless Podman for shared or production systems;
+it requires an immutable repository digest and a successful
+`podman ... Rootless` check. Build a local image with the explicit Docker
+backend in `runner/build_isolated_image.sh`; `pilot-docker` accepts the
+resulting immutable local image ID when the user also passes
+`--acknowledge-rootful-runtime`. That mode uses rootful Docker as a weaker
+trust boundary and is never selected as a fallback. Both modes mount the
+handoff read-only at `/input`, evidence at `/output`, and bounded scratch at
+`/work` and `/tmp`; they drop capabilities, disable networking, use a
+non-root user, apply external resource limits, and share strict evidence
+validation and deterministic identity sidecars. The Docker pilot defaults are
+sized for an 8 GB machine, but its 512 MiB container limit is not the total
+host-memory requirement. See
+[`runner/README.md`](runner/README.md) and
+[`docs/specs/rootless_candidate_runner_v0.1.md`](docs/specs/rootless_candidate_runner_v0.1.md).
+
 ### Verify mutation artifacts
 
 RTLBench can verify a strict `rtl_mutation_manifest_v0.1` JSONL manifest
