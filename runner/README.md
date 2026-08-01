@@ -150,6 +150,14 @@ environment forwarding. The image build smoke test uses the same minimal
 `env -i` environment as runtime and checks both the fixed entrypoint and direct
 `rtlbench.cli` module import.
 
+Copied RTLBench code is normalized to root ownership (`0:0`), with all
+application directories mode `0555` and regular files mode `0444`. This makes
+the source tree traversable and readable by UID/GID `65532` without making it
+writable, and makes the image independent of the checkout or build-host umask.
+The `rtlbench` entrypoint is also root-owned and mode `0555`. Both image smoke
+tests run after `USER 65532:65532`; a root-only import during image build is
+not sufficient evidence that the runtime user can read the application.
+
 Final evidence is validated by RTLBench's strict
 `rtl_candidate_evidence_v0.1` validator before atomic publication. Partial
 evidence is preserved on a bounded timeout or runtime failure. The adjacent

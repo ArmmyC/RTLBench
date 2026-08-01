@@ -175,6 +175,14 @@ environment variables. The Dockerfile build smoke tests use the same minimal
 `env -i` environment as runtime and verify both the fixed wrapper and direct
 `rtlbench.cli` import.
 
+After copying the source, the Dockerfile normalizes the RTLBench tree to root
+ownership (`0:0`), directory mode `0555`, and regular-file mode `0444`. The
+application is therefore readable and traversable by UID/GID `65532` but is not
+writable by that user, regardless of checkout or build-host umask. The fixed
+`rtlbench` entrypoint remains root-owned with mode `0555`. The import and CLI
+smoke tests run after `USER 65532:65532`; a root-only build-time import does not
+establish runtime-user readability.
+
 ## Evidence and publication
 
 Both profiles share the same input, execution, validation, and publication

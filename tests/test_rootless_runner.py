@@ -1170,13 +1170,39 @@ def test_dockerfile_wrapper_and_build_identity_checks_are_explicit():
     dockerfile = (Path(__file__).parents[1] / "runner" / "Dockerfile").read_text(
         encoding="utf-8"
     )
+    copy_src = dockerfile.index("COPY src /opt/rtlbench/src")
+    normalize_source = dockerfile.index("chown -R 0:0 /opt/rtlbench")
+    runtime_user = dockerfile.index("USER 65532:65532")
+    runtime_import = dockerfile.index("os.geteuid() == 65532")
+    runtime_help = dockerfile.index(
+        "/usr/local/bin/rtlbench --help >/dev/null", runtime_user
+    )
+    assert copy_src < normalize_source < runtime_user < runtime_import < runtime_help
+    assert "find /opt/rtlbench -type d -exec chmod 0555 {} +" in dockerfile
+    assert "find /opt/rtlbench -type f -exec chmod 0444 {} +" in dockerfile
+    assert "chown -R 65532:65532 /opt/rtlbench" not in dockerfile
+    assert "test \"$(stat -c '%u:%g' /opt/rtlbench)\" = \"0:0\"" in dockerfile
+    assert "test \"$(stat -c '%a' /opt/rtlbench)\" = \"555\"" in dockerfile
+    assert "test \"$(stat -c '%u:%g' /usr/local/bin/rtlbench)\" = \"0:0\"" in dockerfile
+    assert "test \"$(stat -c '%a' /usr/local/bin/rtlbench)\" = \"555\"" in dockerfile
     assert "'exec /usr/local/bin/python -m rtlbench.cli \"$@\"'" in dockerfile
     assert "'exec python -m rtlbench.cli \"$@\"'" not in dockerfile
     assert "ENTRYPOINT [\"rtlbench\"]" in dockerfile
     assert "COPY src /opt/rtlbench/src" in dockerfile
     assert "test \"$(sed -n '2p' /usr/local/bin/rtlbench)\"" in dockerfile
-    assert "env -i \\\n        HOME=/tmp \\\n        TMPDIR=/tmp \\\n        LANG=C \\\n        LC_ALL=C \\\n        PYTHONPATH=/opt/rtlbench/src \\\n        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \\\n        /usr/local/bin/rtlbench --help >/dev/null" in dockerfile
-    assert "/usr/local/bin/python -c \\\n        'import rtlbench.cli; assert rtlbench.cli.__file__.startswith(\"/opt/rtlbench/src/rtlbench/\")'" in dockerfile
+    assert "env -i \\\n    HOME=/tmp \\\n    TMPDIR=/tmp \\\n    LANG=C \\\n    LC_ALL=C \\\n    PYTHONPATH=/opt/rtlbench/src \\\n    PYTHONDONTWRITEBYTECODE=1 \\\n    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \\\n    /usr/local/bin/rtlbench --help >/dev/null" in dockerfile
+    assert "/usr/local/bin/python -c \\\n    'import os; import pathlib; import rtlbench.cli; assert os.geteuid() == 65532; assert os.getegid() == 65532; assert os.environ[\"PYTHONDONTWRITEBYTECODE\"] == \"1\"; path = pathlib.Path(rtlbench.cli.__file__).resolve(); assert str(path).startswith(\"/opt/rtlbench/src/rtlbench/\"); assert path.is_file(); assert os.access(path, os.R_OK)'" in dockerfile
+
+
+def test_dockerfile_source_permissions_are_umask_independent():
+    dockerfile = (Path(__file__).parents[1] / "runner" / "Dockerfile").read_text(
+        encoding="utf-8"
+    )
+    assert "chown -R 0:0 /opt/rtlbench" in dockerfile
+    assert "find /opt/rtlbench -type d -exec chmod 0555 {} +" in dockerfile
+    assert "find /opt/rtlbench -type f -exec chmod 0444 {} +" in dockerfile
+    assert "chown 0:0 /usr/local/bin/rtlbench" in dockerfile
+    assert "chmod 0555 /usr/local/bin/rtlbench" in dockerfile
 
 
 def test_built_cli_help_succeeds():
