@@ -141,7 +141,7 @@ docker run --pull never --rm --network none --user 65532:65532 --read-only
   --tmpfs /tmp:rw,nosuid,nodev,noexec,size=67108864,mode=1777
   --tmpfs /work:rw,nosuid,nodev,size=134217728,uid=65532,gid=65532,mode=700
   --mount type=bind,src=<input>,dst=/input,readonly
-  --mount type=bind,src=<staged-output>,dst=/output,rw
+  --mount type=bind,src=<staged-output>,dst=/output
   --workdir /work
   --env HOME=/tmp --env TMPDIR=/tmp --env LANG=C --env LC_ALL=C
   --env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -162,6 +162,10 @@ devices, Docker socket mounts, host home or repository mounts, credential or
 secret mounts, arbitrary environment forwarding, or arbitrary container
 commands. Stdin is disabled and the launcher terminates the entire process
 group on the outer timeout.
+
+The `/input` bind mount is explicitly read-only. The `/output` bind mount is
+writable by default because no read-only option is supplied. The `rw` options
+on `/tmp` and `/work` are tmpfs options and remain unchanged.
 
 ## Evidence and publication
 

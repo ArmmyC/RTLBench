@@ -526,13 +526,27 @@ def test_profile_selection_requires_acknowledgement_and_fixed_backend(
         )
 
 
+def _bind_mounts(command: list[str]) -> dict[str, str]:
+    mounts = [
+        command[index + 1]
+        for index, item in enumerate(command[:-1])
+        if item == "--mount"
+    ]
+    return {
+        next(part[4:] for part in mount.split(",") if part.startswith("dst=")): mount
+        for mount in mounts
+    }
+
+
 def test_docker_pilot_command_is_fixed_and_bounded(tmp_path: Path):
     config = runner.load_config(profile=runner.PROFILE_PILOT_DOCKER)
+    input_root = tmp_path / "input"
+    output_root = tmp_path / "output"
     command = runner.build_run_command(
         "/usr/bin/docker",
         IMAGE,
-        tmp_path / "input",
-        tmp_path / "output",
+        input_root,
+        output_root,
         config,
     )
 
@@ -554,13 +568,12 @@ def test_docker_pilot_command_is_fixed_and_bounded(tmp_path: Path):
     assert "nproc=64:64" in command
     assert "/tmp:rw,nosuid,nodev,noexec,size=67108864,mode=1777" in command
     assert "/work:rw,nosuid,nodev,size=134217728,uid=65532,gid=65532,mode=700" in command
-    mounts = [
-        command[index + 1]
-        for index, item in enumerate(command[:-1])
-        if item == "--mount"
-    ]
-    assert any("dst=/input,readonly" in mount for mount in mounts)
-    assert any("dst=/output,rw" in mount for mount in mounts)
+    mounts = _bind_mounts(command)
+    assert mounts["/input"] == f"type=bind,src={input_root},dst=/input,readonly"
+    assert mounts["/output"] == f"type=bind,src={output_root},dst=/output"
+    assert ",rw" not in mounts["/output"]
+    assert ",readonly" not in mounts["/output"]
+    assert ",ro" not in mounts["/output"]
     assert command[command.index(IMAGE) + 1 :] == list(runner.EXPECTED_INNER_COMMAND[1:])
     assert "--userns" not in command
     forbidden = {
@@ -575,6 +588,28 @@ def test_docker_pilot_command_is_fixed_and_bounded(tmp_path: Path):
         "--volumes-from",
     }
     assert not forbidden.intersection(command)
+
+
+def test_writable_output_mount_uses_portable_default_syntax(tmp_path: Path):
+    input_root = tmp_path / "input"
+    output_root = tmp_path / "output"
+    for runtime, profile, input_mode in (
+        ("docker", runner.PROFILE_PILOT_DOCKER, "readonly"),
+        ("podman", runner.PROFILE_PRODUCTION_ROOTLESS, "ro"),
+    ):
+        command = runner.build_run_command(
+            runtime,
+            IMAGE,
+            input_root,
+            output_root,
+            runner.load_config(profile=profile),
+        )
+        mounts = _bind_mounts(command)
+        assert mounts["/input"] == f"type=bind,src={input_root},dst=/input,{input_mode}"
+        assert mounts["/output"] == f"type=bind,src={output_root},dst=/output"
+        assert ",rw" not in mounts["/output"]
+        assert ",readonly" not in mounts["/output"]
+        assert ",ro" not in mounts["/output"]
 
 
 def test_local_docker_image_id_is_published_as_distinct_identity(

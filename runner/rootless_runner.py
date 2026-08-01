@@ -275,7 +275,7 @@ def build_run_command(
         "--mount",
         f"type=bind,src={input_root},dst=/input,{_input_mount_mode(config)}",
         "--mount",
-        f"type=bind,src={output_root},dst=/output,rw",
+        f"type=bind,src={output_root},dst=/output",
         "--workdir",
         "/work",
         "--env",

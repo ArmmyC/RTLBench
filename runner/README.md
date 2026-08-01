@@ -103,6 +103,10 @@ Docker socket mounts, host-home or repository mounts, credential/secret
 mounts, arbitrary environment forwarding, mutable image tags, or arbitrary
 container commands.
 
+The `/input` bind mount is explicitly read-only. The `/output` bind mount is
+writable by default because no read-only option is supplied. The `rw` options
+on `/tmp` and `/work` are tmpfs options and remain unchanged.
+
 ## Production execution
 
 Use rootless Podman explicitly on shared or production systems:
